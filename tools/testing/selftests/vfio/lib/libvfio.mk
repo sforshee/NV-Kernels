@@ -5,6 +5,7 @@ VFIO_DIR := $(selfdir)/vfio
 
 LIBVFIO_C := lib/iommu.c
 LIBVFIO_C += lib/iova_allocator.c
+LIBVFIO_C += lib/libvfio.c
 LIBVFIO_C += lib/vfio_pci_device.c
 LIBVFIO_C += lib/vfio_pci_driver.c
 
