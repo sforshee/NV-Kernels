@@ -2532,6 +2532,8 @@ static __init int cxl_core_init(void)
 	if (rc)
 		goto err_ras;
 
+	cxl_reset_sysfs_init();
+
 	return 0;
 
 err_ras:
@@ -2547,6 +2549,7 @@ err_wq:
 
 static void cxl_core_exit(void)
 {
+	cxl_reset_sysfs_exit();
 	cxl_ras_exit();
 	cxl_region_exit();
 	bus_unregister(&cxl_bus_type);
