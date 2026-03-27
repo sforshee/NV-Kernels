@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 /* SPDX-License-Identifier: GPL-2.0 */
 /* Copyright(c) 2020 Intel Corporation. */
 /* Copyright(c) 2026 Advanced Micro Devices, Inc. */
@@ -224,14 +223,5 @@ struct cxl_dev_state *_devm_cxl_dev_state_create(struct device *dev,
 		(drv_struct *)_devm_cxl_dev_state_create(parent, type, serial, dvsec,	\
 						      sizeof(drv_struct), mbox);	\
 	})
-
-#ifdef CONFIG_CXL_REGION
-bool cxl_region_contains_resource(struct resource *res);
-#else
-static inline bool cxl_region_contains_resource(struct resource *res)
-{
-	return false;
-}
-#endif
 
 #endif /* __CXL_CXL_H__ */
