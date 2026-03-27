@@ -2,6 +2,7 @@
 
 #include <linux/list.h>
 #include <linux/acpi.h>
+#include <linux/dax.h>
 #include <cxl.h>
 
 struct cxl_mock_ops {
@@ -25,8 +26,15 @@ struct cxl_mock_ops {
 	void (*cxl_endpoint_parse_cdat)(struct cxl_port *port);
 	struct cxl_dport *(*devm_cxl_add_dport_by_dev)(struct cxl_port *port,
 						       struct device *dport_dev);
+	int (*walk_hmem_resources)(struct device *host, walk_hmem_fn fn);
+	int (*region_intersects)(resource_size_t start, size_t size,
+				 unsigned long flags, unsigned long desc);
+	int (*region_intersects_soft_reserve)(resource_size_t start,
+					      size_t size);
 };
 
+int hmem_test_init(void);
+void hmem_test_exit(void);
 void register_cxl_mock_ops(struct cxl_mock_ops *ops);
 void unregister_cxl_mock_ops(struct cxl_mock_ops *ops);
 struct cxl_mock_ops *get_cxl_mock_ops(int *index);
