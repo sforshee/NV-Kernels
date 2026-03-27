@@ -15,6 +15,7 @@
 #include "mock.h"
 
 static int interleave_arithmetic;
+static bool fail_autoassemble;
 
 #define FAKE_QTG_ID	42
 
@@ -780,6 +781,12 @@ static void mock_init_hdm_decoder(struct cxl_decoder *cxld)
 	 * See 'cxl list -BMPu -m cxl_mem.0,cxl_mem.4'
 	 */
 	if (!hb0 || pdev->id % 4 || pdev->id > 4 || cxld->id > 0) {
+		default_mock_decoder(cxld);
+		return;
+	}
+
+	/* Simulate missing cxl_mem.4 configuration */
+	if (hb0 && pdev->id == 4 && cxld->id == 0 && fail_autoassemble) {
 		default_mock_decoder(cxld);
 		return;
 	}
@@ -1591,6 +1598,8 @@ static __exit void cxl_test_exit(void)
 
 module_param(interleave_arithmetic, int, 0444);
 MODULE_PARM_DESC(interleave_arithmetic, "Modulo:0, XOR:1");
+module_param(fail_autoassemble, bool, 0444);
+MODULE_PARM_DESC(fail_autoassemble, "Simulate missing member of an auto-region");
 module_init(cxl_test_init);
 module_exit(cxl_test_exit);
 MODULE_LICENSE("GPL v2");
