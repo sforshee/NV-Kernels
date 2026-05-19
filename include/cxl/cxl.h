@@ -224,4 +224,6 @@ struct cxl_dev_state *_devm_cxl_dev_state_create(struct device *dev,
 						      sizeof(drv_struct), mbox);	\
 	})
 
+struct cxl_memdev *devm_cxl_probe_mem(struct cxl_dev_state *cxlds,
+				      struct range *range);
 #endif /* __CXL_CXL_H__ */
