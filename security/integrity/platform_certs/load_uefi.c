@@ -55,6 +55,9 @@ static __init bool uefi_check_ignore_db(void)
 	unsigned long size = sizeof(db);
 	efi_guid_t guid = EFI_SHIM_LOCK_GUID;
 
+	if (!efi_rt_services_supported(EFI_RT_SUPPORTED_GET_VARIABLE))
+		return true;
+
 	status = efi.get_variable(L"MokIgnoreDB", &guid, NULL, &size, &db);
 	return status == EFI_SUCCESS;
 }
@@ -68,6 +71,11 @@ static __init void *get_cert_list(efi_char16_t *name, efi_guid_t *guid,
 	unsigned long lsize = 4;
 	unsigned long tmpdb[4];
 	void *db;
+
+	if (!efi_rt_services_supported(EFI_RT_SUPPORTED_GET_VARIABLE)) {
+		*status = EFI_UNSUPPORTED;
+		return NULL;
+	}
 
 	*status = efi.get_variable(name, guid, NULL, &lsize, &tmpdb);
 	if (*status == EFI_NOT_FOUND)
@@ -188,9 +196,6 @@ static int __init load_uefi_certs(void)
 		pr_err("Reading UEFI Secure Boot Certs is not supported on T2 Macs.\n");
 		return false;
 	}
-
-	if (!efi_rt_services_supported(EFI_RT_SUPPORTED_GET_VARIABLE))
-		return false;
 
 	/* Get db and dbx.  They might not exist, so it isn't an error
 	 * if we can't get them.
