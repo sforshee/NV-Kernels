@@ -236,6 +236,10 @@ ssize_t vfio_pci_bar_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 
 	count = min(count, (size_t)(end - pos));
 
+	/* An excluded sub-range is reached only through its trap. */
+	if (vfio_pci_bar_is_excluded(vdev, bar, pos, count))
+		return -EINVAL;
+
 	if (bar == PCI_ROM_RESOURCE) {
 		/*
 		 * The ROM can fill less space than the BAR, so we start the
@@ -435,6 +439,10 @@ int vfio_pci_ioeventfd(struct vfio_pci_core_device *vdev, loff_t offset,
 	if (bar == vdev->msix_bar &&
 	    !(pos + count <= vdev->msix_offset ||
 	      pos >= vdev->msix_offset + vdev->msix_size))
+		return -EINVAL;
+
+	/* An excluded sub-range is reached only through its trap. */
+	if (vfio_pci_bar_is_excluded(vdev, bar, pos, count))
 		return -EINVAL;
 
 	if (count == 8)
