@@ -71,6 +71,8 @@ struct vfio_pci_device_ops {
 struct vfio_cxl_ops {
 	int	(*init_device)(struct vfio_pci_core_device *vdev);
 	void	(*release_device)(struct vfio_pci_core_device *vdev);
+	int     (*open_device)(struct vfio_pci_core_device *vdev);
+	void    (*close_device)(struct vfio_pci_core_device *vdev);
 	/* Pinned per bound CXL device so vfio-cxl cannot unload under usage */
 	struct module *owner;
 };

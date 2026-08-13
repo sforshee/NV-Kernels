@@ -100,9 +100,20 @@ static void vfio_cxl_release_device(struct vfio_pci_core_device *vdev)
 	vdev->cxl = NULL;
 }
 
+static int vfio_cxl_open_device(struct vfio_pci_core_device *vdev)
+{
+	return 0;
+}
+
+static void vfio_cxl_close_device(struct vfio_pci_core_device *vdev)
+{
+}
+
 static const struct vfio_cxl_ops vfio_cxl_ops = {
 	.init_device	= vfio_cxl_init_device,
 	.release_device	= vfio_cxl_release_device,
+	.open_device	= vfio_cxl_open_device,
+	.close_device	= vfio_cxl_close_device,
 	.owner		= THIS_MODULE,
 };
 
