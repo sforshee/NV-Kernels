@@ -15,6 +15,7 @@
 #include <linux/uaccess.h>
 #include <linux/vfio_pci_core.h>
 #include <cxl/cxl.h>
+#include <cxl/cxl_regs.h>
 #include <cxl/pci.h>
 
 /**
@@ -219,33 +220,159 @@ static int vfio_cxl_register_pfn_space(struct vfio_pci_core_device *vdev)
 	return register_pfn_address_space(&cxl->dpa_pfn_space);
 }
 
+/*
+ * Only an endpoint decoder's control register carries the commit handshake.
+ * A single non-interleaved decoder is assumed; switch topologies would widen
+ * which offsets qualify.
+ */
+static bool vfio_cxl_ctrl_offset(loff_t pos)
+{
+	unsigned int stride = CXL_HDM_DECODER0_CTRL_OFFSET(1) -
+			      CXL_HDM_DECODER0_CTRL_OFFSET(0);
+	loff_t off = pos - CXL_HDM_DECODER0_CTRL_OFFSET(0);
+
+	return pos >= CXL_HDM_DECODER0_CTRL_OFFSET(0) && off % stride == 0;
+}
+
+static void vfio_cxl_ctrl_write(struct vfio_cxl_state *cxl, u32 idx, u32 val)
+{
+	u32 old = le32_to_cpu(cxl->hdm_shadow[idx]);
+	u32 wmask = CXL_HDM_DECODER0_CTRL_IG_MASK |
+		    CXL_HDM_DECODER0_CTRL_IW_MASK |
+		    CXL_HDM_DECODER0_CTRL_LOCK |
+		    CXL_HDM_DECODER0_CTRL_COMMIT |
+		    CXL_HDM_DECODER0_CTRL_HOSTONLY;
+
+	/* A committed decoder that asked to lock stays put until reset. */
+	if ((old & CXL_HDM_DECODER0_CTRL_COMMITTED) &&
+	    (old & CXL_HDM_DECODER0_CTRL_LOCK))
+		return;
+
+	/*
+	 * Take only the guest-writable fields and preserve the reserved bits and
+	 * the emulation-owned status bits (COMMITTED/COMMIT_ERROR) from the
+	 * shadow, so the VMM never reads back guest-authored reserved state.
+	 */
+	val = (old & ~wmask) | (val & wmask);
+
+	/*
+	 * The host resolved the HPA before the guest ever saw the device, so a
+	 * commit request always lands and clearing it tears the guest view down.
+	 */
+	if (val & CXL_HDM_DECODER0_CTRL_COMMIT)
+		val = (val | CXL_HDM_DECODER0_CTRL_COMMITTED) &
+		      ~CXL_HDM_DECODER0_CTRL_COMMIT_ERROR;
+	else
+		val &= ~CXL_HDM_DECODER0_CTRL_COMMITTED;
+
+	cxl->hdm_shadow[idx] = cpu_to_le32(val);
+}
+
+/*
+ * Base, size, and the Target List / Skip registers are all RWL: they lock on
+ * commit, so every one of them is filtered through the committed guard.
+ */
+static bool vfio_cxl_base_size_offset(loff_t pos)
+{
+	return pos == CXL_HDM_DECODER0_BASE_LOW_OFFSET(0) ||
+	       pos == CXL_HDM_DECODER0_BASE_HIGH_OFFSET(0) ||
+	       pos == CXL_HDM_DECODER0_SIZE_LOW_OFFSET(0) ||
+	       pos == CXL_HDM_DECODER0_SIZE_HIGH_OFFSET(0) ||
+	       pos == CXL_HDM_DECODER0_SKIP_LOW(0) ||
+	       pos == CXL_HDM_DECODER0_SKIP_HIGH(0);
+}
+
+/*
+ * Reserved dwords in the single-decoder HDM block: 0x08 and 0x0c between the
+ * global control register and decoder 0, and 0x2c after decoder 0's registers.
+ * Keep them read-only so the VMM never reads back guest-authored reserved state.
+ */
+static bool vfio_cxl_reserved_offset(loff_t pos)
+{
+	return pos == 0x08 || pos == 0x0c || pos == 0x2c;
+}
+
+/*
+ * BASE_LOW and SIZE_LOW expose only the 256MB-aligned upper nibble [31:28];
+ * bits [27:0] are RsvdP. Preserve the reserved low bits so the VMM never reads
+ * back an unaligned base or size.
+ */
+#define CXL_HDM_DECODER_LOW_ADDR_MASK 0xf0000000U
+
+static void vfio_cxl_base_size_write(struct vfio_cxl_state *cxl, u32 idx,
+				     __le32 val)
+{
+	u32 ctrl = le32_to_cpu(cxl->hdm_shadow[CXL_HDM_DECODER0_CTRL_OFFSET(0) /
+					       sizeof(u32)]);
+	loff_t off = (loff_t)idx * sizeof(u32);
+	u32 new = le32_to_cpu(val);
+
+	/* A committed decoder holds its position fields until it decommits. */
+	if (ctrl & CXL_HDM_DECODER0_CTRL_COMMITTED)
+		return;
+
+	if (off == CXL_HDM_DECODER0_BASE_LOW_OFFSET(0) ||
+	    off == CXL_HDM_DECODER0_SIZE_LOW_OFFSET(0)) {
+		u32 old = le32_to_cpu(cxl->hdm_shadow[idx]);
+
+		new = (old & ~CXL_HDM_DECODER_LOW_ADDR_MASK) |
+		      (new & CXL_HDM_DECODER_LOW_ADDR_MASK);
+	}
+
+	cxl->hdm_shadow[idx] = cpu_to_le32(new);
+}
+
 static ssize_t vfio_cxl_comp_rw(struct vfio_pci_core_device *vdev,
 				char __user *buf, size_t count, loff_t *ppos,
 				bool iswrite)
 {
 	struct vfio_cxl_state *cxl = vdev->cxl;
 	loff_t pos = *ppos & VFIO_PCI_OFFSET_MASK;
-
-	/*
-	 * The guest programs a GPA into this decoder and the host resolves the
-	 * HPA, so the guest never drives the physical decoder. Reads come from
-	 * the open-time snapshot; write emulation lands in a later change.
-	 */
-	if (iswrite)
-		return -EINVAL;
+	size_t o;
 
 	if (pos >= cxl->hdm_len)
 		return -EINVAL;
 
+	/* The decoder registers only take aligned dword accesses. */
+	if (pos % sizeof(u32) || count % sizeof(u32))
+		return -EINVAL;
+
 	count = min_t(size_t, count, cxl->hdm_len - pos);
+
+	if (!iswrite) {
+		/*
+		 * The shadow mirrors the physical decoder, so BASE_LOW/HIGH
+		 * carry the host HPA. That is visible only to the trusted VMM
+		 * holding the fd; the VMM virtualizes the base so the guest sees
+		 * its own GPA and never the host address.
+		 */
+		if (copy_to_user(buf, (u8 *)cxl->hdm_shadow + pos, count))
+			return -EFAULT;
+		*ppos += count;
+		return count;
+	}
+
 	/*
-	 * The shadow mirrors the physical decoder, so BASE_LOW/HIGH carry the
-	 * host HPA. That is visible only to the trusted VMM holding the fd; the
-	 * VMM virtualizes the base so the guest sees its own GPA and never the
-	 * host address.
+	 * The guest programs a GPA into this decoder while the host resolves
+	 * the HPA, so writes stay in the shadow. Each register follows its own
+	 * class: control runs the commit handshake, base and size are locked
+	 * once committed, and the capability header is fixed.
 	 */
-	if (copy_to_user(buf, (u8 *)cxl->hdm_shadow + pos, count))
-		return -EFAULT;
+	for (o = 0; o < count; o += sizeof(u32)) {
+		u32 idx = (pos + o) / sizeof(u32);
+		__le32 val;
+
+		if (copy_from_user(&val, buf + o, sizeof(val)))
+			return -EFAULT;
+
+		if (vfio_cxl_ctrl_offset(pos + o))
+			vfio_cxl_ctrl_write(cxl, idx, le32_to_cpu(val));
+		else if (vfio_cxl_base_size_offset(pos + o))
+			vfio_cxl_base_size_write(cxl, idx, val);
+		else if (pos + o >= sizeof(u32) &&
+			 !vfio_cxl_reserved_offset(pos + o))
+			cxl->hdm_shadow[idx] = val;
+	}
 
 	*ppos += count;
 	return count;
@@ -449,7 +576,8 @@ static int vfio_cxl_open_device(struct vfio_pci_core_device *vdev)
 	ret = vfio_pci_core_register_dev_region(vdev, VFIO_REGION_TYPE_CXL,
 						VFIO_REGION_SUBTYPE_CXL_COMP_REGS,
 						&vfio_cxl_comp_regops, cxl->hdm_len,
-						VFIO_REGION_INFO_FLAG_READ, cxl);
+						VFIO_REGION_INFO_FLAG_READ |
+						VFIO_REGION_INFO_FLAG_WRITE, cxl);
 	if (ret)
 		goto err_unregister_hdm;
 
