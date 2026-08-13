@@ -2609,6 +2609,33 @@ static void vfio_pci_dev_set_try_reset(struct vfio_device_set *dev_set)
 	}
 }
 
+static const struct vfio_cxl_ops *vfio_pci_cxl_ops;
+static DEFINE_MUTEX(vfio_pci_cxl_ops_lock);
+
+int vfio_pci_core_register_cxl_ops(const struct vfio_cxl_ops *ops)
+{
+	int ret = 0;
+
+	mutex_lock(&vfio_pci_cxl_ops_lock);
+	if (vfio_pci_cxl_ops)
+		ret = -EBUSY;
+	else
+		vfio_pci_cxl_ops = ops;
+	mutex_unlock(&vfio_pci_cxl_ops_lock);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(vfio_pci_core_register_cxl_ops);
+
+void vfio_pci_core_unregister_cxl_ops(const struct vfio_cxl_ops *ops)
+{
+	mutex_lock(&vfio_pci_cxl_ops_lock);
+	if (vfio_pci_cxl_ops == ops)
+		vfio_pci_cxl_ops = NULL;
+	mutex_unlock(&vfio_pci_cxl_ops_lock);
+}
+EXPORT_SYMBOL_GPL(vfio_pci_core_unregister_cxl_ops);
+
 static void vfio_pci_core_cleanup(void)
 {
 	vfio_pci_uninit_perm_bits();
