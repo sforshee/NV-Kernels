@@ -8,6 +8,7 @@
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/range.h>
+#include <linux/slab.h>
 #include <linux/vfio_pci_core.h>
 #include <cxl/cxl.h>
 #include <cxl/pci.h>
@@ -17,11 +18,17 @@
  * @cxlds: CXL device state; kept first for devm_cxl_dev_state_create()
  * @cxlmd: memory device joined to the CXL topology at bind
  * @hpa_range: host physical range of the HDM region
+ * @dvsec: CXL device DVSEC config-space offset
+ * @dvsec_len: length of the DVSEC body
+ * @dvsec_shadow: guest view of the CXL DVSEC body, sampled at open
  */
 struct vfio_cxl_state {
 	struct cxl_dev_state cxlds;
 	struct cxl_memdev *cxlmd;
 	struct range hpa_range;
+	u16 dvsec;
+	u32 dvsec_len;
+	u32 *dvsec_shadow;
 };
 
 static int vfio_cxl_init_device(struct vfio_pci_core_device *vdev)
@@ -71,6 +78,8 @@ static int vfio_cxl_init_device(struct vfio_pci_core_device *vdev)
 	if (!cxl)
 		return -ENOMEM;
 
+	cxl->dvsec = dvsec;
+
 	/*
 	 * vfio-pci requests the whole component BAR when the guest opens the
 	 * device. Declare the BAR owned so the CXL core maps the HDM/RAS
@@ -102,11 +111,38 @@ static void vfio_cxl_release_device(struct vfio_pci_core_device *vdev)
 
 static int vfio_cxl_open_device(struct vfio_pci_core_device *vdev)
 {
+	struct vfio_cxl_state *cxl = vdev->cxl;
+	struct pci_dev *pdev = vdev->pdev;
+	u32 hdr, *shadow;
+	int i, dwords;
+
+	/*
+	 * Sample the DVSEC body now rather than at bind: a low-power
+	 * transition could have changed it since the device was bound.
+	 */
+	pci_read_config_dword(pdev, cxl->dvsec + PCI_DVSEC_HEADER1, &hdr);
+	cxl->dvsec_len = PCI_DVSEC_HEADER1_LEN(hdr);
+	dwords = cxl->dvsec_len / sizeof(u32);
+
+	shadow = kcalloc(dwords, sizeof(u32), GFP_KERNEL);
+	if (!shadow)
+		return -ENOMEM;
+
+	for (i = 0; i < dwords; i++)
+		pci_read_config_dword(pdev, cxl->dvsec + i * sizeof(u32),
+				      &shadow[i]);
+
+	cxl->dvsec_shadow = shadow;
+
 	return 0;
 }
 
 static void vfio_cxl_close_device(struct vfio_pci_core_device *vdev)
 {
+	struct vfio_cxl_state *cxl = vdev->cxl;
+
+	kfree(cxl->dvsec_shadow);
+	cxl->dvsec_shadow = NULL;
 }
 
 static const struct vfio_cxl_ops vfio_cxl_ops = {
