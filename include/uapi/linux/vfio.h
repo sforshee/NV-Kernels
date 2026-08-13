@@ -345,6 +345,7 @@ struct vfio_region_info_cap_type {
 #define VFIO_REGION_TYPE_GFX                    (1)
 #define VFIO_REGION_TYPE_CCW			(2)
 #define VFIO_REGION_TYPE_MIGRATION_DEPRECATED   (3)
+#define VFIO_REGION_TYPE_CXL			(4)
 
 /* sub-types for VFIO_REGION_TYPE_PCI_* */
 
@@ -372,6 +373,10 @@ struct vfio_region_info_cap_type {
 
 /* sub-types for VFIO_REGION_TYPE_GFX */
 #define VFIO_REGION_SUBTYPE_GFX_EDID            (1)
+
+/* sub-types for VFIO_REGION_TYPE_CXL */
+/* CXL.mem HDM region of a Type-2 device, mmap-able */
+#define VFIO_REGION_SUBTYPE_CXL_MEM		(1)
 
 /**
  * struct vfio_region_gfx_edid - EDID region layout.
