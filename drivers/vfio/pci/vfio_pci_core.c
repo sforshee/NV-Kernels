@@ -1777,6 +1777,14 @@ void vfio_pci_zap_and_down_write_memory_lock(struct vfio_pci_core_device *vdev)
 {
 	down_write(&vdev->memory_lock);
 	vfio_pci_zap_bars(vdev);
+	/*
+	 * The HDM region lives in the device-region offset range that
+	 * vfio_pci_zap_bars() does not cover, so revoke it here too. Otherwise
+	 * a runtime-PM entry, D3 transition, or reset would leave the guest
+	 * with live mappings into a quiesced device.
+	 */
+	if (vdev->cxl_ops && vdev->cxl_ops->zap)
+		vdev->cxl_ops->zap(vdev);
 }
 
 u16 vfio_pci_memory_lock_and_enable(struct vfio_pci_core_device *vdev)

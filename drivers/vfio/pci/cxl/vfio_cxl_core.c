@@ -527,6 +527,31 @@ static void vfio_cxl_release_device(struct vfio_pci_core_device *vdev)
 	vdev->cxl = NULL;
 }
 
+static void vfio_cxl_zap(struct vfio_pci_core_device *vdev)
+{
+	struct vfio_cxl_state *cxl = vdev->cxl;
+
+	lockdep_assert_held_write(&vdev->memory_lock);
+
+	if (!cxl)
+		return;
+
+	/*
+	 * Revoke the mapping so a later access re-faults. Do not touch hdm_valid
+	 * here: zap also runs on a plain PCI Memory-Space disable, across which
+	 * the committed HDM decoder stays valid (CXL.mem is not gated by PCI
+	 * Memory-Space). hdm_valid tracks decoder validity and is cleared only by
+	 * the paths that can leave the decoder unrestored (a failed reset or PM
+	 * restore). A reset or D3 transition holds memory_lock for write while it
+	 * runs, so no fault races the revoke, and a runtime-suspended device is
+	 * caught by the pm_runtime_engaged check on the insert path.
+	 */
+	unmap_mapping_range(vdev->vdev.inode->i_mapping,
+			    VFIO_PCI_INDEX_TO_OFFSET(VFIO_PCI_NUM_REGIONS +
+						     cxl->hdm_region_idx),
+			    range_len(&cxl->hpa_range), true);
+}
+
 static int vfio_cxl_open_device(struct vfio_pci_core_device *vdev)
 {
 	struct vfio_cxl_state *cxl = vdev->cxl;
@@ -588,6 +613,9 @@ static int vfio_cxl_open_device(struct vfio_pci_core_device *vdev)
 						VFIO_REGION_INFO_FLAG_MMAP, cxl);
 	if (ret)
 		goto err_free_shadows;
+
+	/* Remember where the HDM region landed so it can be zapped by index. */
+	cxl->hdm_region_idx = vdev->num_regions - 1;
 
 	ret = vfio_pci_core_register_dev_region(vdev, VFIO_REGION_TYPE_CXL,
 						VFIO_REGION_SUBTYPE_CXL_COMP_REGS,
@@ -733,6 +761,7 @@ static const struct vfio_cxl_ops vfio_cxl_ops = {
 	.close_device	= vfio_cxl_close_device,
 	.config_read	= vfio_cxl_config_read,
 	.config_write	= vfio_cxl_config_write,
+	.zap		= vfio_cxl_zap,
 	.owner		= THIS_MODULE,
 };
 

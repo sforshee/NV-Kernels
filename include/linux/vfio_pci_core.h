@@ -77,6 +77,8 @@ struct vfio_cxl_ops {
 			       int count, __le32 *val);
 	int     (*config_write)(struct vfio_pci_core_device *vdev, int pos,
 				int count, __le32 val);
+	/* Revoke the HDM mapping; paired with the BAR zap */
+	void    (*zap)(struct vfio_pci_core_device *vdev);
 
 	/* Pinned per bound CXL device so vfio-cxl cannot unload under usage */
 	struct module *owner;
