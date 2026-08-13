@@ -36,9 +36,29 @@ static int vfio_cxl_init_device(struct vfio_pci_core_device *vdev)
 	if (!pdev->hdm)
 		return -EPROBE_DEFER;
 
+	/* The guest drives one virtual decoder; multiple are unsupported. */
+	if (pdev->hdm->decoder_count != 1)
+		return -EOPNOTSUPP;
+
 	hdm_size = range_len(&pdev->hdm->settings[0].hpa_range);
 	if (!hdm_size)
 		return -ENXIO;
+
+	/* Interleaved decoders are unsupported. */
+	if (pdev->hdm->settings[0].interleave_ways != 1)
+		return -EOPNOTSUPP;
+
+	/*
+	 * The guest drives resets through the CXL Device DVSEC and polls the
+	 * shadow for completion. If the host cannot service a function-scoped
+	 * CXL reset (no reset DVSEC, a multifunction device, or no HDM reset
+	 * support), that guest request could never complete, so refuse the
+	 * device rather than advertise a reset the guest would poll on forever.
+	 */
+	if (!cxl_reset_capable(pdev)) {
+		pci_err(pdev, "vfio-cxl: Unsupported device: host cannot service a CXL reset request\n");
+		return -EOPNOTSUPP;
+	}
 
 	dvsec = pci_find_dvsec_capability(pdev, PCI_VENDOR_ID_CXL,
 					  PCI_DVSEC_CXL_DEVICE);
