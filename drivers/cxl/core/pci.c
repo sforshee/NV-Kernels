@@ -799,7 +799,7 @@ static int cxl_rcrb_get_comp_regs(struct pci_dev *pdev,
 }
 
 int cxl_pci_setup_regs(struct pci_dev *pdev, enum cxl_regloc_type type,
-		       struct cxl_register_map *map)
+		       struct cxl_register_map *map, bool bar_owned)
 {
 	int rc;
 
@@ -828,6 +828,13 @@ int cxl_pci_setup_regs(struct pci_dev *pdev, enum cxl_regloc_type type,
 	} else if (rc) {
 		return rc;
 	}
+
+	/*
+	 * A caller that owns the whole register BAR (for example vfio-cxl)
+	 * maps the sub-blocks without claiming them, so the later
+	 * cxl_map_component_regs() does not collide with the full-BAR request.
+	 */
+	map->skip_sub_bar_request = bar_owned;
 
 	return cxl_setup_regs(map);
 }

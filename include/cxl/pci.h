@@ -18,5 +18,5 @@ struct cxl_register_map;
 struct pci_dev;
 
 int cxl_pci_setup_regs(struct pci_dev *pdev, enum cxl_regloc_type type,
-		       struct cxl_register_map *map);
+		       struct cxl_register_map *map, bool bar_owned);
 #endif
