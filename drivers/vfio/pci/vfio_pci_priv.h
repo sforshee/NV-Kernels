@@ -78,6 +78,26 @@ int vfio_pci_set_power_state(struct vfio_pci_core_device *vdev,
 			     pci_power_t state);
 
 void vfio_pci_zap_and_down_write_memory_lock(struct vfio_pci_core_device *vdev);
+
+static inline void vfio_pci_cxl_zap(struct vfio_pci_core_device *vdev)
+{
+	if (vdev->cxl_ops && vdev->cxl_ops->zap)
+		vdev->cxl_ops->zap(vdev);
+}
+
+static inline void vfio_pci_cxl_post_reset(struct vfio_pci_core_device *vdev)
+{
+	if (vdev->cxl_ops && vdev->cxl_ops->post_reset)
+		vdev->cxl_ops->post_reset(vdev);
+}
+
+static inline int vfio_pci_cxl_pm_restore(struct vfio_pci_core_device *vdev)
+{
+	if (vdev->cxl_ops && vdev->cxl_ops->pm_restore)
+		return vdev->cxl_ops->pm_restore(vdev);
+	return 0;
+}
+
 u16 vfio_pci_memory_lock_and_enable(struct vfio_pci_core_device *vdev);
 void vfio_pci_memory_unlock_and_restore(struct vfio_pci_core_device *vdev,
 					u16 cmd);

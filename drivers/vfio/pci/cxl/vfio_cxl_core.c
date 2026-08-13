@@ -552,6 +552,86 @@ static void vfio_cxl_zap(struct vfio_pci_core_device *vdev)
 			    range_len(&cxl->hpa_range), true);
 }
 
+static void vfio_cxl_post_reset(struct vfio_pci_core_device *vdev)
+{
+	struct vfio_cxl_state *cxl = vdev->cxl;
+	struct pci_dev *pdev = vdev->pdev;
+	bool re_enabled = false;
+	int i, dwords;
+	u16 cmd;
+
+	lockdep_assert_held_write(&vdev->memory_lock);
+
+	if (!cxl || !cxl->hdm_shadow)
+		return;
+
+	/*
+	 * The decoder registers are read through the component BAR. A config
+	 * restore can leave Memory Space disabled, and the read would then
+	 * return an Unsupported Request, so re-enable it before sampling.
+	 */
+	pci_read_config_word(pdev, PCI_COMMAND, &cmd);
+	if (!(cmd & PCI_COMMAND_MEMORY)) {
+		pci_write_config_word(pdev, PCI_COMMAND,
+				      cmd | PCI_COMMAND_MEMORY);
+		re_enabled = true;
+	}
+
+	dwords = cxl->hdm_len / sizeof(u32);
+	for (i = 0; i < dwords; i++)
+		cxl->hdm_shadow[i] = cpu_to_le32(readl(cxl->hdm_regs +
+						       i * sizeof(u32)));
+	/*
+	 * Leave Memory Space as it was found. The guest owns Memory Space
+	 * through vconfig, so a physical enable done only to sample must not
+	 * outlive the sampling or the function would decode while vconfig
+	 * reports it off.
+	 */
+	if (re_enabled)
+		pci_write_config_word(pdev, PCI_COMMAND, cmd);
+}
+
+static int vfio_cxl_pm_restore(struct vfio_pci_core_device *vdev)
+{
+	struct vfio_cxl_state *cxl = vdev->cxl;
+	struct pci_dev *pdev = vdev->pdev;
+	int rc;
+
+	lockdep_assert_held_write(&vdev->memory_lock);
+
+	if (!cxl || !cxl->hdm_shadow) {
+		pci_dbg(pdev, "vfio-cxl: pm_restore: no shadow (device not open), skipping\n");
+		return 0;
+	}
+
+	/*
+	 * A D3hot->D0 transition can soft-reset the function and clear the HDM
+	 * decoder. Restore the physical decoder before the fault gate re-inserts
+	 * the mapping. The restore needs the device lock, taken here after
+	 * memory_lock to match the reset path ordering. On failure the decoder is
+	 * left unrestored, so close the access gate (zap no longer clears it) and
+	 * return the error so the caller keeps the HDM range inaccessible.
+	 */
+	if (!pci_dev_trylock(pdev)) {
+		pci_warn(pdev, "vfio-cxl: pm_restore: could not lock device, HDM not restored\n");
+		cxl->hdm_valid = false;
+		return -EBUSY;
+	}
+
+	rc = cxl_restore_hdm_after_pci_reset(pdev);
+	pci_dev_unlock(pdev);
+	if (rc) {
+		pci_err(pdev, "vfio-cxl: pm_restore: HDM restore failed: %d\n", rc);
+		cxl->hdm_valid = false;
+		return rc;
+	}
+
+	vfio_cxl_post_reset(vdev);
+	/* The decoder is restored and re-sampled, so reopen the access gate. */
+	cxl->hdm_valid = true;
+	return 0;
+}
+
 static int vfio_cxl_open_device(struct vfio_pci_core_device *vdev)
 {
 	struct vfio_cxl_state *cxl = vdev->cxl;
@@ -762,6 +842,8 @@ static const struct vfio_cxl_ops vfio_cxl_ops = {
 	.config_read	= vfio_cxl_config_read,
 	.config_write	= vfio_cxl_config_write,
 	.zap		= vfio_cxl_zap,
+	.post_reset	= vfio_cxl_post_reset,
+	.pm_restore	= vfio_cxl_pm_restore,
 	.owner		= THIS_MODULE,
 };
 

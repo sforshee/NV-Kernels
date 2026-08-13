@@ -79,6 +79,10 @@ struct vfio_cxl_ops {
 				int count, __le32 val);
 	/* Revoke the HDM mapping; paired with the BAR zap */
 	void    (*zap)(struct vfio_pci_core_device *vdev);
+	/* Re-sample the decoder state once a reset has settled */
+	void    (*post_reset)(struct vfio_pci_core_device *vdev);
+	/* Restore the HDM decoder after a D3hot->D0 soft reset */
+	int     (*pm_restore)(struct vfio_pci_core_device *vdev);
 
 	/* Pinned per bound CXL device so vfio-cxl cannot unload under usage */
 	struct module *owner;

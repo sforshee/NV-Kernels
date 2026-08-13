@@ -307,6 +307,14 @@ int vfio_pci_set_power_state(struct vfio_pci_core_device *vdev, pci_power_t stat
 		} else if (needs_restore) {
 			pci_load_and_free_saved_state(pdev, &vdev->pm_save);
 			pci_restore_state(pdev);
+			/*
+			 * A NoSoftRst- device soft-resets on D3hot->D0, which can
+			 * clear a CXL HDM decoder. Restore it before the fault
+			 * gate re-inserts the HDM mapping. memory_lock is held on
+			 * this path (the PM config write and runtime PM entry both
+			 * take it before the D0 transition).
+			 */
+			vfio_pci_cxl_pm_restore(vdev);
 		}
 	}
 
@@ -474,6 +482,13 @@ static int vfio_pci_core_runtime_resume(struct device *dev)
 		eventfd_signal(vdev->pm_wake_eventfd_ctx);
 		__vfio_pci_runtime_pm_exit(vdev);
 	}
+	/*
+	 * A NoSoftRst- function can soft-reset on the runtime D3hot->D0
+	 * transition and clear a CXL HDM decoder. Restore it while memory_lock
+	 * is held, before the fault gate can re-insert the HDM mapping. PCI
+	 * config restore alone does not restore the component decoder registers.
+	 */
+	vfio_pci_cxl_pm_restore(vdev);
 	up_write(&vdev->memory_lock);
 
 	if (vdev->pm_intx_masked)
@@ -1394,6 +1409,7 @@ static int vfio_pci_ioctl_reset(struct vfio_pci_core_device *vdev,
 
 	vfio_pci_dma_buf_move(vdev, true);
 	ret = pci_try_reset_function(vdev->pdev);
+	vfio_pci_cxl_post_reset(vdev);
 	if (__vfio_pci_memory_enabled(vdev))
 		vfio_pci_dma_buf_move(vdev, false);
 	up_write(&vdev->memory_lock);
@@ -1783,8 +1799,7 @@ void vfio_pci_zap_and_down_write_memory_lock(struct vfio_pci_core_device *vdev)
 	 * a runtime-PM entry, D3 transition, or reset would leave the guest
 	 * with live mappings into a quiesced device.
 	 */
-	if (vdev->cxl_ops && vdev->cxl_ops->zap)
-		vdev->cxl_ops->zap(vdev);
+	vfio_pci_cxl_zap(vdev);
 }
 
 u16 vfio_pci_memory_lock_and_enable(struct vfio_pci_core_device *vdev)
@@ -2719,6 +2734,8 @@ static int vfio_pci_dev_set_hot_reset(struct vfio_device_set *dev_set,
 
 		vfio_pci_dma_buf_move(vdev, true);
 		vfio_pci_zap_bars(vdev);
+		/* zap_bars misses the HDM window; bus reset needs it too */
+		vfio_pci_cxl_zap(vdev);
 	}
 
 	if (!list_entry_is_head(vdev,
@@ -2740,6 +2757,10 @@ static int vfio_pci_dev_set_hot_reset(struct vfio_device_set *dev_set,
 		vfio_pci_set_power_state(vdev, PCI_D0);
 
 	ret = pci_reset_bus(pdev);
+
+	/* Re-sample decoder state for any CXL device the bus reset touched. */
+	list_for_each_entry(vdev, &dev_set->device_list, vdev.dev_set_list)
+		vfio_pci_cxl_post_reset(vdev);
 
 	vdev = list_last_entry(&dev_set->device_list,
 			       struct vfio_pci_core_device, vdev.dev_set_list);
