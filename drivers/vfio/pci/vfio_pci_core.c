@@ -2122,6 +2122,44 @@ static void vfio_pci_vga_uninit(struct vfio_pci_core_device *vdev)
 					      VGA_RSRC_LEGACY_MEM);
 }
 
+static const struct vfio_cxl_ops *vfio_pci_cxl_ops;
+static DEFINE_MUTEX(vfio_pci_cxl_ops_lock);
+
+static const struct vfio_cxl_ops *vfio_pci_get_cxl_ops(void)
+{
+	const struct vfio_cxl_ops *ops;
+
+	mutex_lock(&vfio_pci_cxl_ops_lock);
+	ops = vfio_pci_cxl_ops;
+	if (ops && !try_module_get(ops->owner))
+		ops = NULL;
+	mutex_unlock(&vfio_pci_cxl_ops_lock);
+
+	return ops;
+}
+
+/*
+ * A CXL Type-2 device advertises both CXL.cache and CXL.mem in its CXL DVSEC.
+ * pcie_is_cxl() is also true for Type-1 (cache only) and Type-3 (mem only)
+ * devices, which the vfio-cxl provider does not handle, so confirm the Type-2
+ * identity before engaging it.
+ */
+static bool vfio_pci_is_cxl_type2(struct pci_dev *pdev)
+{
+	u16 dvsec, cap;
+
+	dvsec = pci_find_dvsec_capability(pdev, PCI_VENDOR_ID_CXL,
+					  PCI_DVSEC_CXL_DEVICE);
+	if (!dvsec)
+		return false;
+
+	if (pci_read_config_word(pdev, dvsec + PCI_DVSEC_CXL_CAP, &cap))
+		return false;
+
+	return (cap & PCI_DVSEC_CXL_CACHE_CAPABLE) &&
+	       (cap & PCI_DVSEC_CXL_MEM_CAPABLE);
+}
+
 int vfio_pci_core_init_dev(struct vfio_device *core_vdev)
 {
 	struct vfio_pci_core_device *vdev =
@@ -2143,6 +2181,41 @@ int vfio_pci_core_init_dev(struct vfio_device *core_vdev)
 	init_rwsem(&vdev->memory_lock);
 	xa_init(&vdev->ctx);
 
+	/*
+	 * Load vfio-cxl on demand for a CXL device. If it is absent, drive the
+	 * device as plain vfio-pci rather than failing the bind.
+	 */
+	if (pcie_is_cxl(vdev->pdev) && vfio_pci_is_cxl_type2(vdev->pdev)) {
+		const struct vfio_cxl_ops *ops;
+
+		request_module("vfio-cxl");
+		ops = vfio_pci_get_cxl_ops();
+		if (ops) {
+			ret = ops->init_device(vdev);
+			if (ret) {
+				module_put(ops->owner);
+				return ret;
+			}
+			vdev->cxl_ops = ops;
+			/*
+			 * Pin the device in D0 while bound rather than let
+			 * the host power it down between opens.
+			 */
+			vdev->disable_idle_d3 = true;
+		} else if (IS_BUILTIN(CONFIG_VFIO_CXL)) {
+			/*
+			 * Only DEFER for a built-in provider so the bind
+			 * retries once vfio-cxl registers its ops.
+			 * A modular provider was already loaded synchronously
+			 * by request_module() above, so if it is still absent
+			 * it is missing, blocked, or failed to init; drive the
+			 * device as plain vfio-pci then rather than defer the
+			 * bind forever.
+			 */
+			return -EPROBE_DEFER;
+		}
+	}
+
 	return 0;
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_init_dev);
@@ -2151,6 +2224,11 @@ void vfio_pci_core_release_dev(struct vfio_device *core_vdev)
 {
 	struct vfio_pci_core_device *vdev =
 		container_of(core_vdev, struct vfio_pci_core_device, vdev);
+
+	if (vdev->cxl_ops) {
+		vdev->cxl_ops->release_device(vdev);
+		module_put(vdev->cxl_ops->owner);
+	}
 
 	mutex_destroy(&vdev->igate);
 	mutex_destroy(&vdev->ioeventfds_lock);
@@ -2608,9 +2686,6 @@ static void vfio_pci_dev_set_try_reset(struct vfio_device_set *dev_set)
 		pm_runtime_put(&cur->pdev->dev);
 	}
 }
-
-static const struct vfio_cxl_ops *vfio_pci_cxl_ops;
-static DEFINE_MUTEX(vfio_pci_cxl_ops_lock);
 
 int vfio_pci_core_register_cxl_ops(const struct vfio_cxl_ops *ops)
 {
