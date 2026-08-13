@@ -10,6 +10,7 @@
 #include <linux/range.h>
 #include <linux/vfio_pci_core.h>
 #include <cxl/cxl.h>
+#include <cxl/pci.h>
 
 /**
  * struct vfio_cxl_state - per-device state for a vfio-cxl device
@@ -69,6 +70,16 @@ static int vfio_cxl_init_device(struct vfio_pci_core_device *vdev)
 					false);
 	if (!cxl)
 		return -ENOMEM;
+
+	/*
+	 * vfio-pci requests the whole component BAR when the guest opens the
+	 * device. Declare the BAR owned so the CXL core maps the HDM/RAS
+	 * sub-blocks without claiming them and that request does not collide.
+	 */
+	ret = cxl_pci_setup_regs(pdev, CXL_REGLOC_RBI_COMPONENT,
+				 &cxl->cxlds.reg_map, true);
+	if (ret)
+		return ret;
 
 	ret = cxl_set_capacity(&cxl->cxlds, hdm_size);
 	if (ret)
