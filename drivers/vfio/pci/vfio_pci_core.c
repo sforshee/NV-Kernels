@@ -2369,10 +2369,12 @@ int vfio_pci_core_init_dev(struct vfio_device *core_vdev)
 	xa_init(&vdev->ctx);
 
 	/*
-	 * Load vfio-cxl on demand for a CXL device. If it is absent, drive the
-	 * device as plain vfio-pci rather than failing the bind.
+	 * Load vfio-cxl on demand for a CXL device unless the user opted out.
+	 * If it is opted out or absent, drive the device as plain vfio-pci
+	 * rather than failing the bind.
 	 */
-	if (pcie_is_cxl(vdev->pdev) && vfio_pci_is_cxl_type2(vdev->pdev)) {
+	if (!vdev->disable_cxl && pcie_is_cxl(vdev->pdev) &&
+	    vfio_pci_is_cxl_type2(vdev->pdev)) {
 		const struct vfio_cxl_ops *ops;
 
 		request_module("vfio-cxl");
