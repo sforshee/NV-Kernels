@@ -1068,6 +1068,23 @@ int vfio_pci_core_register_dev_region(struct vfio_pci_core_device *vdev,
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_register_dev_region);
 
+/*
+ * Unregister the most recently registered dynamic region. Used to unwind a
+ * partially built region set on an open-time error; regions are otherwise
+ * released together in vfio_pci_core_disable().
+ */
+void vfio_pci_core_unregister_dev_region(struct vfio_pci_core_device *vdev)
+{
+	struct vfio_pci_region *region;
+
+	if (WARN_ON(!vdev->num_regions))
+		return;
+
+	region = &vdev->region[--vdev->num_regions];
+	region->ops->release(vdev, region);
+}
+EXPORT_SYMBOL_GPL(vfio_pci_core_unregister_dev_region);
+
 static int vfio_pci_info_atomic_cap(struct vfio_pci_core_device *vdev,
 				    struct vfio_info_cap *caps)
 {

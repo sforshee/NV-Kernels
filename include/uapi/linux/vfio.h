@@ -377,6 +377,9 @@ struct vfio_region_info_cap_type {
 /* sub-types for VFIO_REGION_TYPE_CXL */
 /* CXL.mem HDM region of a Type-2 device, mmap-able */
 #define VFIO_REGION_SUBTYPE_CXL_MEM		(1)
+/* CXL HDM decoder registers, trapped so the guest programs a GPA it never owns */
+#define VFIO_REGION_SUBTYPE_CXL_COMP_REGS	(2)
+/* Subtypes 3+ are reserved for future trapped CXL surfaces, e.g. RAS. */
 
 /**
  * struct vfio_region_gfx_edid - EDID region layout.

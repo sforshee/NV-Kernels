@@ -188,6 +188,7 @@ int vfio_pci_core_register_dev_region(struct vfio_pci_core_device *vdev,
 				      unsigned int type, unsigned int subtype,
 				      const struct vfio_pci_regops *ops,
 				      size_t size, u32 flags, void *data);
+void vfio_pci_core_unregister_dev_region(struct vfio_pci_core_device *vdev);
 void vfio_pci_core_set_mmap_exclude(struct vfio_pci_core_device *vdev, int bar,
 				    u64 start, u64 len);
 void vfio_pci_core_close_device(struct vfio_device *core_vdev);
