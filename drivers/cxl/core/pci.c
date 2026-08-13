@@ -230,7 +230,6 @@ int cxl_await_media_ready(struct cxl_dev_state *cxlds)
 	struct pci_dev *pdev = to_pci_dev(cxlds->dev);
 	int d = cxlds->cxl_dvsec;
 	int rc, i, hdm_count;
-	u64 md_status;
 	u16 cap;
 
 	rc = pci_read_config_word(pdev,
@@ -251,9 +250,17 @@ int cxl_await_media_ready(struct cxl_dev_state *cxlds)
 			return rc;
 	}
 
-	md_status = readq(cxlds->regs.memdev + CXLMDEV_STATUS_OFFSET);
-	if (!CXLMDEV_READY(md_status))
-		return -EIO;
+	/*
+	 * It is possible some Type-2 devices (CXL_DEVTYPE_DEVMEM) do not
+	 * implement regs.memdev; only consult the Memdev Status register when
+	 * the group is actually present.
+	 */
+	if (cxlds->regs.memdev) {
+		u64 md_status = readq(cxlds->regs.memdev + CXLMDEV_STATUS_OFFSET);
+
+		if (!CXLMDEV_READY(md_status))
+			return -EIO;
+	}
 
 	return 0;
 }

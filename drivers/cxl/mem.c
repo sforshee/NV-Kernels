@@ -95,8 +95,13 @@ static int cxl_mem_probe(struct device *dev)
 	struct dentry *dentry;
 	int rc;
 
-	if (!cxlds->media_ready)
-		return -EBUSY;
+	if (!cxlds->media_ready) {
+		rc = cxl_await_media_ready(cxlds);
+		if (rc)
+			return rc;
+		cxlds->media_ready = true;
+		dev_dbg(dev, "CXL media ready\n");
+	}
 
 	/*
 	 * Someone is trying to reattach this device after it lost its port
