@@ -1102,6 +1102,39 @@ void vfio_pci_uninit_perm_bits(void)
 	free_perm_bits(&ecap_perms[PCI_EXT_CAP_ID_PWR]);
 }
 
+/*
+ * DVSEC accesses are dispatched to vfio-cxl for a CXL device. It handles the
+ * CXL DVSEC and returns -ENODEV for any other DVSEC, for which the default
+ * handling then applies.
+ */
+static int vfio_pci_dvsec_config_read(struct vfio_pci_core_device *vdev, int pos,
+				      int count, struct perm_bits *perm,
+				      int offset, __le32 *val)
+{
+	if (vdev->cxl_ops && vdev->cxl_ops->config_read) {
+		int ret = vdev->cxl_ops->config_read(vdev, pos, count, val);
+
+		if (ret != -ENODEV)
+			return ret;
+	}
+
+	return vfio_direct_config_read(vdev, pos, count, perm, offset, val);
+}
+
+static int vfio_pci_dvsec_config_write(struct vfio_pci_core_device *vdev,
+				       int pos, int count, struct perm_bits *perm,
+				       int offset, __le32 val)
+{
+	if (vdev->cxl_ops && vdev->cxl_ops->config_write) {
+		int ret = vdev->cxl_ops->config_write(vdev, pos, count, val);
+
+		if (ret != -ENODEV)
+			return ret;
+	}
+
+	return vfio_raw_config_write(vdev, pos, count, perm, offset, val);
+}
+
 int __init vfio_pci_init_perm_bits(void)
 {
 	int ret;
@@ -1121,7 +1154,8 @@ int __init vfio_pci_init_perm_bits(void)
 	ret |= init_pci_ext_cap_err_perm(&ecap_perms[PCI_EXT_CAP_ID_ERR]);
 	ret |= init_pci_ext_cap_pwr_perm(&ecap_perms[PCI_EXT_CAP_ID_PWR]);
 	ecap_perms[PCI_EXT_CAP_ID_VNDR].writefn = vfio_raw_config_write;
-	ecap_perms[PCI_EXT_CAP_ID_DVSEC].writefn = vfio_raw_config_write;
+	ecap_perms[PCI_EXT_CAP_ID_DVSEC].readfn = vfio_pci_dvsec_config_read;
+	ecap_perms[PCI_EXT_CAP_ID_DVSEC].writefn = vfio_pci_dvsec_config_write;
 
 	if (ret)
 		vfio_pci_uninit_perm_bits();

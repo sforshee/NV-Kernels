@@ -145,11 +145,99 @@ static void vfio_cxl_close_device(struct vfio_pci_core_device *vdev)
 	cxl->dvsec_shadow = NULL;
 }
 
+/* Read a 16-bit DVSEC field from the shadow; @off is DVSEC-relative. */
+static u16 vfio_cxl_dvsec16(struct vfio_cxl_state *cxl, u32 off)
+{
+	u32 dw = cxl->dvsec_shadow[off / sizeof(u32)];
+
+	return (dw >> (8 * (off % sizeof(u32)))) & 0xffff;
+}
+
+/*
+ * Apply the CXL r4.0 8.1.3 write class for the 16-bit DVSEC register at @off.
+ * Control is programmable, Status is write-1-to-clear, and Capability, Lock and
+ * the Range registers stay fixed at their firmware snapshot.
+ */
+static u16 vfio_cxl_dvsec_field(u32 off, u16 old, u16 wval, u16 wmask)
+{
+	switch (off) {
+	case PCI_DVSEC_CXL_CTRL:
+		/*
+		 * CXL.mem stays enabled for as long as the guest owns the device.
+		 * The HDM decoder maps the guest window to device memory, so a
+		 * store to it while CXL.mem is disabled completes on the device as
+		 * an error that the host fabric reports as an SError, which is
+		 * fatal. The spec does not pin down accesses to a decoder whose
+		 * CXL.mem is off and many hosts SError, so ignore a guest request
+		 * to clear the enable and keep the bit set.
+		 */
+		return ((old & ~wmask) | (wval & wmask)) | PCI_DVSEC_CXL_MEM_ENABLE;
+	case PCI_DVSEC_CXL_CTRL2:
+		return (old & ~wmask) | (wval & wmask);
+	case PCI_DVSEC_CXL_STATUS:
+	case PCI_DVSEC_CXL_STATUS2:
+		return old & ~(wval & wmask);
+	default:
+		return old;
+	}
+}
+
+/* Config accesses never cross a dword, so a single shadow entry covers them. */
+static int vfio_cxl_config_read(struct vfio_pci_core_device *vdev, int pos,
+				int count, __le32 *val)
+{
+	struct vfio_cxl_state *cxl = vdev->cxl;
+	int boff = (pos - cxl->dvsec) % sizeof(u32);
+	__le32 dword;
+
+	if (pos < cxl->dvsec || pos >= cxl->dvsec + cxl->dvsec_len)
+		return -ENODEV;
+
+	dword = cpu_to_le32(cxl->dvsec_shadow[(pos - cxl->dvsec) / sizeof(u32)]);
+	memcpy(val, (u8 *)&dword + boff, count);
+
+	return count;
+}
+
+static int vfio_cxl_config_write(struct vfio_pci_core_device *vdev, int pos,
+				 int count, __le32 val)
+{
+	struct vfio_cxl_state *cxl = vdev->cxl;
+	int idx = (pos - cxl->dvsec) / sizeof(u32);
+	int boff = (pos - cxl->dvsec) % sizeof(u32);
+	u32 off = idx * sizeof(u32);
+	__le32 le_wval = 0, le_wmask = 0;
+	u32 old, wval, wmask;
+	u16 lo, hi;
+
+	if (pos < cxl->dvsec || pos >= cxl->dvsec + cxl->dvsec_len)
+		return -ENODEV;
+
+	/*
+	 * Place the guest bytes and a matching byte mask at the write offset,
+	 * then let the per-field class decide what actually lands in the shadow.
+	 * The hardware is never touched.
+	 */
+	memcpy((u8 *)&le_wval + boff, &val, count);
+	memset((u8 *)&le_wmask + boff, 0xff, count);
+	old = cxl->dvsec_shadow[idx];
+	wval = le32_to_cpu(le_wval);
+	wmask = le32_to_cpu(le_wmask);
+
+	lo = vfio_cxl_dvsec_field(off, old, wval, wmask);
+	hi = vfio_cxl_dvsec_field(off + 2, old >> 16, wval >> 16, wmask >> 16);
+	cxl->dvsec_shadow[idx] = lo | ((u32)hi << 16);
+
+	return count;
+}
+
 static const struct vfio_cxl_ops vfio_cxl_ops = {
 	.init_device	= vfio_cxl_init_device,
 	.release_device	= vfio_cxl_release_device,
 	.open_device	= vfio_cxl_open_device,
 	.close_device	= vfio_cxl_close_device,
+	.config_read	= vfio_cxl_config_read,
+	.config_write	= vfio_cxl_config_write,
 	.owner		= THIS_MODULE,
 };
 
