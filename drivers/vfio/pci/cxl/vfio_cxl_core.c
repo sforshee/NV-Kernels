@@ -336,6 +336,14 @@ static int vfio_cxl_init_device(struct vfio_pci_core_device *vdev)
 
 	cxl->hdm_len = pdev->hdm->hdm_size;
 
+	/*
+	 * The HDM decoder block is served from the trapped component-register
+	 * region. Keep it out of the guest's direct BAR mapping so the physical
+	 * decoder, which governs host memory decode, cannot be reprogrammed.
+	 */
+	vfio_pci_core_set_mmap_exclude(vdev, pdev->hdm->hdm_bar,
+				       pdev->hdm->hdm_offset, cxl->hdm_len);
+
 	ret = cxl_set_capacity(&cxl->cxlds, hdm_size);
 	if (ret)
 		return ret;
