@@ -153,10 +153,23 @@ int vfio_pci_core_get_dmabuf_phys(struct vfio_pci_core_device *vdev,
 				  size_t nr_ranges)
 {
 	struct pci_dev *pdev = vdev->pdev;
+	unsigned int i;
 
 	*provider = pcim_p2pdma_provider(pdev, region_index);
 	if (!*provider)
 		return -EINVAL;
+
+	/*
+	 * A provider (e.g. vfio-cxl) can exclude a BAR sub-range that must be
+	 * reached only through its trap. The mmap and read/write paths already
+	 * refuse it; reject a DMA-BUF export overlapping it too, so a device fd
+	 * holder cannot map the excluded registers to a peer and bypass the trap.
+	 */
+	for (i = 0; i < nr_ranges; i++)
+		if (vfio_pci_bar_is_excluded(vdev, region_index,
+					     dma_ranges[i].offset,
+					     dma_ranges[i].length))
+			return -EINVAL;
 
 	return vfio_pci_core_fill_phys_vec(
 		phys_vec, dma_ranges, nr_ranges,

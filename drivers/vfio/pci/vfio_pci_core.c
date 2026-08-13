@@ -954,6 +954,67 @@ static int msix_mmappable_cap(struct vfio_pci_core_device *vdev,
 	return vfio_info_add_capability(caps, &header, sizeof(header));
 }
 
+/*
+ * A provider can keep a BAR sub-range off mmap (for example a CXL device's
+ * trapped HDM decoder block). Callers hold the resource so /dev/mem is already
+ * blocked; this only governs the vfio mmap path.
+ */
+void vfio_pci_core_set_mmap_exclude(struct vfio_pci_core_device *vdev, int bar,
+				    u64 start, u64 len)
+{
+	vdev->mmap_exclude_bar = bar;
+	vdev->mmap_exclude_start = start;
+	vdev->mmap_exclude_len = len;
+}
+EXPORT_SYMBOL_GPL(vfio_pci_core_set_mmap_exclude);
+
+/* Advertise the BAR as mmappable minus the excluded sub-range. */
+static int vfio_pci_mmap_exclude_cap(struct vfio_pci_core_device *vdev,
+				     int index, struct vfio_info_cap *caps)
+{
+	u64 bar_len = pci_resource_len(vdev->pdev, index);
+	u64 excl_start = ALIGN_DOWN(vdev->mmap_exclude_start, PAGE_SIZE);
+	u64 excl_end = ALIGN(vdev->mmap_exclude_start + vdev->mmap_exclude_len,
+			     PAGE_SIZE);
+	struct vfio_region_info_cap_sparse_mmap *sparse;
+	int nr_areas = 0, i = 0, ret;
+	size_t size;
+
+	/*
+	 * mmap is page granular, so the mmappable areas must stop at the page
+	 * boundaries enclosing the excluded sub-range. The byte-granular
+	 * exclusion still governs the fault and read/write paths; only the
+	 * advertised mmap areas round out to whole pages.
+	 */
+	if (excl_start > 0)
+		nr_areas++;
+	if (excl_end < bar_len)
+		nr_areas++;
+
+	size = struct_size(sparse, areas, nr_areas);
+	sparse = kzalloc(size, GFP_KERNEL);
+	if (!sparse)
+		return -ENOMEM;
+
+	sparse->header.id = VFIO_REGION_INFO_CAP_SPARSE_MMAP;
+	sparse->header.version = 1;
+	sparse->nr_areas = nr_areas;
+
+	if (excl_start > 0) {
+		sparse->areas[i].offset = 0;
+		sparse->areas[i].size = excl_start;
+		i++;
+	}
+	if (excl_end < bar_len) {
+		sparse->areas[i].offset = excl_end;
+		sparse->areas[i].size = bar_len - excl_end;
+	}
+
+	ret = vfio_info_add_capability(caps, &sparse->header, size);
+	kfree(sparse);
+	return ret;
+}
+
 int vfio_pci_core_register_dev_region(struct vfio_pci_core_device *vdev,
 				      unsigned int type, unsigned int subtype,
 				      const struct vfio_pci_regops *ops,
@@ -1099,6 +1160,13 @@ int vfio_pci_ioctl_get_region_info(struct vfio_device *core_vdev,
 			info->flags |= VFIO_REGION_INFO_FLAG_MMAP;
 			if (info->index == vdev->msix_bar) {
 				ret = msix_mmappable_cap(vdev, caps);
+				if (ret)
+					return ret;
+			}
+			if (vdev->mmap_exclude_len &&
+			    info->index == vdev->mmap_exclude_bar) {
+				ret = vfio_pci_mmap_exclude_cap(vdev, info->index,
+								caps);
 				if (ret)
 					return ret;
 			}
@@ -1794,6 +1862,10 @@ int vfio_pci_core_mmap(struct vfio_device *core_vdev, struct vm_area_struct *vma
 	req_start = pgoff << PAGE_SHIFT;
 
 	if (req_start + req_len > phys_len)
+		return -EINVAL;
+
+	/* An excluded sub-range is reachable only through its trap, not mmap. */
+	if (vfio_pci_bar_is_excluded(vdev, index, req_start, req_len))
 		return -EINVAL;
 
 	/*

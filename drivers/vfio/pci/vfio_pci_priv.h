@@ -40,6 +40,19 @@ ssize_t vfio_pci_config_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 ssize_t vfio_pci_bar_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 			size_t count, loff_t *ppos, bool iswrite);
 
+/*
+ * A provider (e.g. vfio-cxl) can carve a sub-range out of a BAR that must be
+ * reached only through its trap, never the direct BAR.  Returns true when
+ * [start, start + len) on this BAR overlaps that excluded range.
+ */
+static inline bool vfio_pci_bar_is_excluded(struct vfio_pci_core_device *vdev,
+					    int bar, u64 start, u64 len)
+{
+	return vdev->mmap_exclude_len && bar == vdev->mmap_exclude_bar &&
+	       start < vdev->mmap_exclude_start + vdev->mmap_exclude_len &&
+	       start + len > vdev->mmap_exclude_start;
+}
+
 #ifdef CONFIG_VFIO_PCI_VGA
 ssize_t vfio_pci_vga_rw(struct vfio_pci_core_device *vdev, char __user *buf,
 			size_t count, loff_t *ppos, bool iswrite);

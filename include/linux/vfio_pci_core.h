@@ -163,6 +163,10 @@ struct vfio_pci_core_device {
 	struct notifier_block	nb;
 	struct rw_semaphore	memory_lock;
 	struct list_head	dmabufs;
+	/* BAR sub-range a provider keeps off mmap, reached only through a trap */
+	int			mmap_exclude_bar;
+	u64			mmap_exclude_start;
+	u64			mmap_exclude_len;
 };
 
 enum vfio_pci_io_width {
@@ -177,6 +181,8 @@ int vfio_pci_core_register_dev_region(struct vfio_pci_core_device *vdev,
 				      unsigned int type, unsigned int subtype,
 				      const struct vfio_pci_regops *ops,
 				      size_t size, u32 flags, void *data);
+void vfio_pci_core_set_mmap_exclude(struct vfio_pci_core_device *vdev, int bar,
+				    u64 start, u64 len);
 void vfio_pci_core_close_device(struct vfio_device *core_vdev);
 int vfio_pci_core_init_dev(struct vfio_device *core_vdev);
 void vfio_pci_core_release_dev(struct vfio_device *core_vdev);
