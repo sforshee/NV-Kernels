@@ -83,6 +83,8 @@ struct vfio_cxl_ops {
 	void    (*post_reset)(struct vfio_pci_core_device *vdev);
 	/* Restore the HDM decoder after a D3hot->D0 soft reset */
 	int     (*pm_restore)(struct vfio_pci_core_device *vdev);
+	/* Run the CXL reset sequence; the core holds memory_lock across it */
+	int     (*reset)(struct vfio_pci_core_device *vdev);
 
 	/* Pinned per bound CXL device so vfio-cxl cannot unload under usage */
 	struct module *owner;
@@ -90,6 +92,7 @@ struct vfio_cxl_ops {
 
 int vfio_pci_core_register_cxl_ops(const struct vfio_cxl_ops *ops);
 void vfio_pci_core_unregister_cxl_ops(const struct vfio_cxl_ops *ops);
+int vfio_pci_core_cxl_reset(struct vfio_pci_core_device *vdev);
 
 #if IS_ENABLED(CONFIG_VFIO_PCI_DMABUF)
 int vfio_pci_core_fill_phys_vec(struct dma_buf_phys_vec *phys_vec,

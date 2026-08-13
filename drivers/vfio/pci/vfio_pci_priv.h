@@ -98,6 +98,8 @@ static inline int vfio_pci_cxl_pm_restore(struct vfio_pci_core_device *vdev)
 	return 0;
 }
 
+int vfio_pci_reset_function(struct vfio_pci_core_device *vdev);
+
 u16 vfio_pci_memory_lock_and_enable(struct vfio_pci_core_device *vdev);
 void vfio_pci_memory_unlock_and_restore(struct vfio_pci_core_device *vdev,
 					u16 cmd);

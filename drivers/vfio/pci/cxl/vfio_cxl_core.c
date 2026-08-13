@@ -7,6 +7,7 @@
 
 #include <linux/cleanup.h>
 #include <linux/memory-failure.h>
+#include <linux/memregion.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/pci.h>
@@ -756,6 +757,16 @@ static u16 vfio_cxl_dvsec16(struct vfio_cxl_state *cxl, u32 off)
 	return (dw >> (8 * (off % sizeof(u32)))) & 0xffff;
 }
 
+/* Write a 16-bit DVSEC field into the shadow; the field must not straddle a dword. */
+static void vfio_cxl_dvsec_write16(struct vfio_cxl_state *cxl, u32 off, u16 val)
+{
+	u32 shift = 8 * (off % sizeof(u32));
+	u32 idx = off / sizeof(u32);
+
+	cxl->dvsec_shadow[idx] &= ~(0xffffU << shift);
+	cxl->dvsec_shadow[idx] |= (u32)val << shift;
+}
+
 /*
  * Apply the CXL r4.0 8.1.3 write class for the 16-bit DVSEC register at @off.
  * Control is programmable, Status is write-1-to-clear, and Capability, Lock and
@@ -810,11 +821,13 @@ static int vfio_cxl_config_write(struct vfio_pci_core_device *vdev, int pos,
 	int boff = (pos - cxl->dvsec) % sizeof(u32);
 	u32 off = idx * sizeof(u32);
 	__le32 le_wval = 0, le_wmask = 0;
+	u16 before, after, lo, hi;
 	u32 old, wval, wmask;
-	u16 lo, hi;
 
 	if (pos < cxl->dvsec || pos >= cxl->dvsec + cxl->dvsec_len)
 		return -ENODEV;
+
+	before = vfio_cxl_dvsec16(cxl, PCI_DVSEC_CXL_CTRL2);
 
 	/*
 	 * Place the guest bytes and a matching byte mask at the write offset,
@@ -831,7 +844,157 @@ static int vfio_cxl_config_write(struct vfio_pci_core_device *vdev, int pos,
 	hi = vfio_cxl_dvsec_field(off + 2, old >> 16, wval >> 16, wmask >> 16);
 	cxl->dvsec_shadow[idx] = lo | ((u32)hi << 16);
 
+	/*
+	 * A 0->1 write of Initiate_CXL_Reset asks for a CXL reset. It is not
+	 * forwarded to hardware; cxl_reset_dvsec_sequence() drives the state
+	 * machine, and the outcome comes back through STATUS2.
+	 */
+	after = vfio_cxl_dvsec16(cxl, PCI_DVSEC_CXL_CTRL2);
+	if (!(before & PCI_DVSEC_CXL_INIT_CXL_RST) &&
+	    (after & PCI_DVSEC_CXL_INIT_CXL_RST) &&
+	    cxl_reset_capable(vdev->pdev))
+		vfio_pci_core_cxl_reset(vdev);
+
 	return count;
+}
+
+static int vfio_cxl_reset(struct vfio_pci_core_device *vdev)
+{
+	struct vfio_cxl_state *cxl = vdev->cxl;
+	struct pci_dev *pdev = vdev->pdev;
+	struct pci_saved_state *saved_state;
+	bool mem_clr;
+	u16 ctrl2, status2, cmd;
+	int ret;
+
+	lockdep_assert_held_write(&vdev->memory_lock);
+
+	/*
+	 * The host cxl_reset PCI method cannot run for a vfio-owned device: it
+	 * requests the HDM range that this driver already holds exclusively, so
+	 * it always fails busy. Drive the DVSEC reset directly here. Report
+	 * not-capable so the core reset path can fall back to a standard PCI
+	 * reset for a device with no CXL reset, such as a multifunction device.
+	 */
+	if (!cxl_reset_capable(pdev))
+		return -ENOTTY;
+
+	/*
+	 * Mem_Clr_En comes from the guest shadow CTRL2 while the device is open.
+	 * The core reset path also drives this reset at VM power on and off with
+	 * no shadow present, so read it from the live DVSEC then.
+	 */
+	if (cxl->dvsec_shadow)
+		ctrl2 = vfio_cxl_dvsec16(cxl, PCI_DVSEC_CXL_CTRL2);
+	else
+		pci_read_config_word(pdev, cxl->dvsec + PCI_DVSEC_CXL_CTRL2,
+				     &ctrl2);
+	mem_clr = ctrl2 & PCI_DVSEC_CXL_RST_MEM_CLR_EN;
+
+	/*
+	 * Mem_Clr is guest-controlled (Mem_Clr_En in the DVSEC CTRL2), so honor it
+	 * and pass it to cxl_reset_dvsec_sequence(). It zeroes the device memory,
+	 * but that sequence does not write back host CPU caches over the HDM range
+	 * the way the host cxl_reset method does. The range is mapped write-back,
+	 * so a dirty host line could survive the clear and overwrite it; invalidate
+	 * it first when the platform can.
+	 *
+	 * When cpu_cache_has_invalidate_memregion() is false proceed rather
+	 * than abort. Unlike native CXL region invalidation, which the host
+	 * manages and must fail safe, the host CPU never writes passthrough
+	 * HDM range: the guest owns it through its stage-2 mapping, so there
+	 * are no dirty host lines for the clear to lose.
+	 * Warn once so the case is visible rather than silent.
+	 */
+	if (mem_clr) {
+		if (cpu_cache_has_invalidate_memregion()) {
+			ret = cpu_cache_invalidate_memregion(cxl->hpa_range.start,
+							     range_len(&cxl->hpa_range));
+			if (ret) {
+				pci_err(pdev, "vfio-cxl: reset: CPU cache invalidate failed (%d), aborting reset\n",
+					ret);
+				return ret;
+			}
+		} else {
+			pci_warn_once(pdev, "vfio-cxl: reset: no CPU cache invalidation available; proceeding with Mem_Clr (host does not cache the HDM range)\n");
+		}
+	}
+
+	/*
+	 * A CXL reset can clear config like an FLR, so save state and drop Bus
+	 * Master for the reset window; the function masters the bus again only
+	 * once the decoders are restored.
+	 *
+	 * Sample the guest's Bus Master intent from live config before the reset
+	 * perturbs it, so it can be reapplied after the decoder is known good with
+	 * no window in which pci_restore_state() leaves Bus Master enabled.
+	 */
+	pci_read_config_word(pdev, PCI_COMMAND, &cmd);
+
+	saved_state = pci_store_saved_state(pdev);
+	if (!saved_state && pdev->state_saved) {
+		pci_err(pdev, "vfio-cxl: reset: saved-state stash failed (-ENOMEM), aborting reset\n");
+		return -ENOMEM;
+	}
+	if (saved_state)
+		pci_save_state(pdev);
+	pci_clear_master(pdev);
+	ret = cxl_reset_dvsec_sequence(pdev, mem_clr);
+	pci_restore_state(pdev);
+	pci_clear_master(pdev);
+	/*
+	 * pci_restore_state() reinstated the guest's PCI_COMMAND, which may have
+	 * re-enabled Bus Master while the reset outcome, and thus decoder
+	 * validity, is not yet known. The pci_clear_master() above is its
+	 * immediate next statement, so there is no window in which a failed reset
+	 * could DMA over decoders that were not restored.
+	 */
+	if (saved_state)
+		pci_load_and_free_saved_state(pdev, &saved_state);
+	/*
+	 * Re-enable Bus Master only for a clean reset or -EBUSY (the reset never
+	 * ran, so the firmware-committed decoder is intact), and only if the guest
+	 * had it enabled (sampled before the reset).
+	 */
+	if ((!ret || ret == -EBUSY) && (cmd & PCI_COMMAND_MASTER))
+		pci_set_master(pdev);
+
+	vfio_cxl_post_reset(vdev);
+
+	/*
+	 * A clean reset restored the decoder, and -EBUSY means the reset never
+	 * ran so the firmware-committed decoder is intact: both are known-good.
+	 * Any other error may have left the decoder unrestored, so close the gate
+	 * until the next open or restore. Faults cannot race this: the caller
+	 * holds memory_lock for write across the whole reset.
+	 */
+	if (cxl->hdm_shadow) {
+		if (!ret || ret == -EBUSY)
+			cxl->hdm_valid = true;
+		else
+			cxl->hdm_valid = false;
+	}
+
+	/*
+	 * The guest-facing DVSEC bookkeeping only applies while the device is
+	 * open. Initiate_CXL_Reset self-clears in hardware; mirror that and
+	 * stamp the outcome onto a fresh hardware STATUS2 read for the polling
+	 * guest. A contended -EBUSY reports as an error so the guest can reissue
+	 * rather than poll a result that never comes.
+	 */
+	if (cxl->dvsec_shadow) {
+		vfio_cxl_dvsec_write16(cxl, PCI_DVSEC_CXL_CTRL2,
+				       vfio_cxl_dvsec16(cxl, PCI_DVSEC_CXL_CTRL2) &
+				       ~PCI_DVSEC_CXL_INIT_CXL_RST);
+
+		pci_read_config_word(pdev, cxl->dvsec + PCI_DVSEC_CXL_STATUS2,
+				     &status2);
+		status2 &= ~(PCI_DVSEC_CXL_RST_DONE | PCI_DVSEC_CXL_RST_ERR);
+		status2 |= ret ? PCI_DVSEC_CXL_RST_ERR : PCI_DVSEC_CXL_RST_DONE;
+		vfio_cxl_dvsec_write16(cxl, PCI_DVSEC_CXL_STATUS2, status2);
+	}
+
+	return ret;
 }
 
 static const struct vfio_cxl_ops vfio_cxl_ops = {
@@ -844,6 +1007,7 @@ static const struct vfio_cxl_ops vfio_cxl_ops = {
 	.zap		= vfio_cxl_zap,
 	.post_reset	= vfio_cxl_post_reset,
 	.pm_restore	= vfio_cxl_pm_restore,
+	.reset		= vfio_cxl_reset,
 	.owner		= THIS_MODULE,
 };
 
@@ -864,3 +1028,4 @@ MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("VFIO support for CXL Type-2 devices");
 MODULE_ALIAS("vfio-cxl");
 MODULE_IMPORT_NS("CXL");
+MODULE_IMPORT_NS("DEVMEM");

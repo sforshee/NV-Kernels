@@ -580,8 +580,26 @@ int vfio_pci_core_enable(struct vfio_pci_core_device *vdev)
 		goto out_power;
 
 	/* If reset fails because of the device lock, fail this path entirely */
-	ret = pci_try_reset_function(pdev);
-	if (ret == -EAGAIN)
+	if (vdev->cxl_ops && vdev->cxl_ops->reset) {
+		/*
+		 * VM power-on resets a CXL Type-2 device through its DVSEC
+		 * sequence. vconfig is not built yet here, so take memory_lock
+		 * and call the op directly rather than the wrapper.
+		 */
+		down_write(&vdev->memory_lock);
+		ret = vdev->cxl_ops->reset(vdev);
+		up_write(&vdev->memory_lock);
+	} else {
+		ret = pci_try_reset_function(pdev);
+	}
+	/*
+	 * -EAGAIN means the reset could not run. For a CXL device any reset
+	 * error must also fail the open: a failed DVSEC reset can leave the HDM
+	 * decoder cleared or unrestored, and continuing would expose the HDM
+	 * region for host access through a decoder in an unknown state.
+	 */
+	if (ret == -EAGAIN ||
+	    (vdev->cxl_ops && vdev->cxl_ops->reset && ret))
 		goto out_disable_device;
 
 	vdev->reset_works = !ret;
@@ -769,16 +787,30 @@ void vfio_pci_core_disable(struct vfio_pci_core_device *vdev)
 	 * overwrite the previously restored configuration information.
 	 */
 	if (vdev->reset_works) {
-		bridge = pci_upstream_bridge(pdev);
-		if (bridge && !pci_dev_trylock(bridge))
-			goto out_restore_state;
-		if (pci_dev_trylock(pdev)) {
-			if (!__pci_reset_function_locked(pdev))
+		if (vdev->cxl_ops && vdev->cxl_ops->reset) {
+			/*
+			 * VM power-off resets a CXL Type-2 device through its
+			 * DVSEC sequence. The sequence takes its own device lock,
+			 * so run it outside the lock below.
+			 * vconfig is already freed here, so call the op directly
+			 * under memory_lock rather than the wrapper.
+			 */
+			down_write(&vdev->memory_lock);
+			if (!vdev->cxl_ops->reset(vdev))
 				vdev->needs_reset = false;
-			pci_dev_unlock(pdev);
+			up_write(&vdev->memory_lock);
+		} else {
+			bridge = pci_upstream_bridge(pdev);
+			if (bridge && !pci_dev_trylock(bridge))
+				goto out_restore_state;
+			if (pci_dev_trylock(pdev)) {
+				if (!__pci_reset_function_locked(pdev))
+					vdev->needs_reset = false;
+				pci_dev_unlock(pdev);
+			}
+			if (bridge)
+				pci_dev_unlock(bridge);
 		}
-		if (bridge)
-			pci_dev_unlock(bridge);
 	}
 
 out_restore_state:
@@ -1386,6 +1418,20 @@ static int vfio_pci_ioctl_set_irqs(struct vfio_pci_core_device *vdev,
 	return ret;
 }
 
+/*
+ * Reset a function the way a guest asked for. A CXL Type-2 device resets
+ * through its DVSEC sequence: the host cxl_reset method would collide
+ * with the exclusive HDM range this driver holds and fail busy. Everything else
+ * takes a standard PCI function reset. The caller holds memory_lock, which the
+ * DVSEC sequence requires.
+ */
+int vfio_pci_reset_function(struct vfio_pci_core_device *vdev)
+{
+	if (vdev->cxl_ops && vdev->cxl_ops->reset)
+		return vdev->cxl_ops->reset(vdev);
+	return pci_try_reset_function(vdev->pdev);
+}
+
 static int vfio_pci_ioctl_reset(struct vfio_pci_core_device *vdev,
 				void __user *arg)
 {
@@ -1408,7 +1454,7 @@ static int vfio_pci_ioctl_reset(struct vfio_pci_core_device *vdev,
 	vfio_pci_set_power_state(vdev, PCI_D0);
 
 	vfio_pci_dma_buf_move(vdev, true);
-	ret = pci_try_reset_function(vdev->pdev);
+	ret = vfio_pci_reset_function(vdev);
 	vfio_pci_cxl_post_reset(vdev);
 	if (__vfio_pci_memory_enabled(vdev))
 		vfio_pci_dma_buf_move(vdev, false);
@@ -2676,6 +2722,21 @@ static int vfio_pci_dev_set_hot_reset(struct vfio_device_set *dev_set,
 	}
 
 	/*
+	 * A multifunction CXL Type-2 device cannot be bus reset: its DVSEC
+	 * reset acts per function, so a shared secondary bus reset would reset
+	 * sibling functions out from under their own state. Reject it, matching
+	 * the cxl_reset bus method. A single-function device is quiesced through
+	 * its DVSEC sequence just before the reset below.
+	 */
+	list_for_each_entry(vdev, &dev_set->device_list, vdev.dev_set_list) {
+		if (vdev->cxl_ops && vdev->cxl_ops->reset &&
+		    vdev->pdev->multifunction) {
+			ret = -ENOTTY;
+			goto err_unlock;
+		}
+	}
+
+	/*
 	 * Some of the devices in the dev_set can be in the runtime suspended
 	 * state. Increment the usage count for all the devices in the dev_set
 	 * before reset and decrement the same after reset.
@@ -2756,11 +2817,57 @@ static int vfio_pci_dev_set_hot_reset(struct vfio_device_set *dev_set,
 	list_for_each_entry(vdev, &dev_set->device_list, vdev.dev_set_list)
 		vfio_pci_set_power_state(vdev, PCI_D0);
 
+	/*
+	 * Quiesce each CXL Type-2 device through its DVSEC sequence before the
+	 * secondary bus reset: the bus reset alone does not write back the
+	 * device cache or tear down the HDM decoders. memory_lock is held. If a
+	 * quiesce fails, abort before the bus reset: resetting an unquiesced CXL
+	 * device risks data loss or a fabric error. Every device is locked here,
+	 * so unwind from the last one.
+	 */
+	list_for_each_entry(vdev, &dev_set->device_list, vdev.dev_set_list) {
+		if (vdev->cxl_ops && vdev->cxl_ops->reset) {
+			ret = vdev->cxl_ops->reset(vdev);
+			if (ret) {
+				pci_warn(vdev->pdev, "vfio-cxl: hot reset: DVSEC quiesce failed (%d), aborting before bus reset\n",
+					 ret);
+				vdev = list_last_entry(&dev_set->device_list,
+						       struct vfio_pci_core_device,
+						       vdev.dev_set_list);
+				goto err_undo;
+			}
+		}
+	}
+
 	ret = pci_reset_bus(pdev);
 
-	/* Re-sample decoder state for any CXL device the bus reset touched. */
-	list_for_each_entry(vdev, &dev_set->device_list, vdev.dev_set_list)
-		vfio_pci_cxl_post_reset(vdev);
+	/*
+	 * pci_reset_bus() restored each device's PCI_COMMAND, which can re-enable
+	 * Bus Master, but the secondary bus reset cleared the physical HDM decoder
+	 * that the CXL quiesce above restored. Until it is restored a CXL device
+	 * could DMA over cleared decode, so for each CXL device drop Bus Master,
+	 * restore and re-sample the decoder, then re-enable Bus Master to the
+	 * guest's intent only once the decoder is known good. Re-sampling alone
+	 * would leave hdm_valid true over a cleared decoder. Keep the first restore
+	 * error so a failed restore is reported instead of the bus reset's success.
+	 */
+	list_for_each_entry(vdev, &dev_set->device_list, vdev.dev_set_list) {
+		u16 cmd;
+		int rret;
+
+		if (!(vdev->cxl_ops && vdev->cxl_ops->reset))
+			continue;
+
+		pci_read_config_word(vdev->pdev, PCI_COMMAND, &cmd);
+		pci_clear_master(vdev->pdev);
+		rret = vfio_pci_cxl_pm_restore(vdev);
+		if (rret) {
+			if (!ret)
+				ret = rret;
+		} else if (cmd & PCI_COMMAND_MASTER) {
+			pci_set_master(vdev->pdev);
+		}
+	}
 
 	vdev = list_last_entry(&dev_set->device_list,
 			       struct vfio_pci_core_device, vdev.dev_set_list);
@@ -2816,6 +2923,16 @@ static void vfio_pci_dev_set_try_reset(struct vfio_device_set *dev_set)
 		return;
 
 	/*
+	 * A multifunction CXL Type-2 device cannot be bus reset (its DVSEC
+	 * reset is per function), so skip the automatic reset rather than reset
+	 * sibling functions out from under their state.
+	 */
+	list_for_each_entry(cur, &dev_set->device_list, vdev.dev_set_list)
+		if (cur->cxl_ops && cur->cxl_ops->reset &&
+		    cur->pdev->multifunction)
+			return;
+
+	/*
 	 * Some of the devices in the bus can be in the runtime suspended
 	 * state. Increment the usage count for all the devices in the dev_set
 	 * before reset and decrement the same after reset.
@@ -2823,9 +2940,56 @@ static void vfio_pci_dev_set_try_reset(struct vfio_device_set *dev_set)
 	if (vfio_pci_dev_set_pm_runtime_get(dev_set))
 		return;
 
+	/*
+	 * Quiesce each CXL Type-2 device through its DVSEC sequence before the
+	 * bus reset, which alone does not write back the device cache or tear
+	 * down the HDM decoders. Take memory_lock and zap the HDM window as the
+	 * explicit hot reset does. On lock contention or a failed quiesce, skip
+	 * the bus reset and leave needs_reset set for a later retry.
+	 */
+	list_for_each_entry(cur, &dev_set->device_list, vdev.dev_set_list) {
+		if (!(cur->cxl_ops && cur->cxl_ops->reset))
+			continue;
+		if (!down_write_trylock(&cur->memory_lock))
+			goto unwind;
+		vfio_pci_cxl_zap(cur);
+		if (cur->cxl_ops->reset(cur)) {
+			up_write(&cur->memory_lock);
+			goto unwind;
+		}
+	}
+
 	if (!pci_reset_bus(pdev))
 		reset_done = true;
 
+	list_for_each_entry(cur, &dev_set->device_list, vdev.dev_set_list) {
+		u16 cmd;
+
+		if (!(cur->cxl_ops && cur->cxl_ops->reset))
+			continue;
+		/*
+		 * pci_reset_bus() restored PCI_COMMAND, which can re-enable Bus
+		 * Master, but the bus reset cleared the physical HDM decoder. Drop
+		 * Bus Master, restore and re-sample the decoder, then re-enable Bus
+		 * Master to the guest's intent once the decoder is known good.
+		 * Re-sampling alone would leave hdm_valid true over a cleared
+		 * decoder.
+		 */
+		pci_read_config_word(cur->pdev, PCI_COMMAND, &cmd);
+		pci_clear_master(cur->pdev);
+		if (!vfio_pci_cxl_pm_restore(cur) && (cmd & PCI_COMMAND_MASTER))
+			pci_set_master(cur->pdev);
+		up_write(&cur->memory_lock);
+	}
+	goto out;
+
+unwind:
+	list_for_each_entry_continue_reverse(cur, &dev_set->device_list,
+					     vdev.dev_set_list)
+		if (cur->cxl_ops && cur->cxl_ops->reset)
+			up_write(&cur->memory_lock);
+
+out:
 	list_for_each_entry(cur, &dev_set->device_list, vdev.dev_set_list) {
 		if (reset_done)
 			cur->needs_reset = false;
@@ -2857,6 +3021,29 @@ void vfio_pci_core_unregister_cxl_ops(const struct vfio_cxl_ops *ops)
 	mutex_unlock(&vfio_pci_cxl_ops_lock);
 }
 EXPORT_SYMBOL_GPL(vfio_pci_core_unregister_cxl_ops);
+
+/*
+ * Drive a guest-requested CXL reset. The memory_lock, mapping revoke and
+ * dma-buf quiesce are core-internal, so vfio-cxl calls in here to run them
+ * around its DVSEC reset sequence.
+ */
+int vfio_pci_core_cxl_reset(struct vfio_pci_core_device *vdev)
+{
+	int ret;
+
+	if (!vdev->cxl_ops || !vdev->cxl_ops->reset)
+		return -ENOTTY;
+
+	vfio_pci_zap_and_down_write_memory_lock(vdev);
+	vfio_pci_dma_buf_move(vdev, true);
+	ret = vdev->cxl_ops->reset(vdev);
+	if (__vfio_pci_memory_enabled(vdev))
+		vfio_pci_dma_buf_move(vdev, false);
+	up_write(&vdev->memory_lock);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(vfio_pci_core_cxl_reset);
 
 static void vfio_pci_core_cleanup(void)
 {
