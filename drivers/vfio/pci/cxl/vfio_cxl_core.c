@@ -6,15 +6,67 @@
  */
 
 #include <linux/module.h>
+#include <linux/pci.h>
+#include <linux/range.h>
 #include <linux/vfio_pci_core.h>
+#include <cxl/cxl.h>
+
+/**
+ * struct vfio_cxl_state - per-device state for a vfio-cxl device
+ * @cxlds: CXL device state; kept first for devm_cxl_dev_state_create()
+ * @cxlmd: memory device joined to the CXL topology at bind
+ * @hpa_range: host physical range of the HDM region
+ */
+struct vfio_cxl_state {
+	struct cxl_dev_state cxlds;
+	struct cxl_memdev *cxlmd;
+	struct range hpa_range;
+};
 
 static int vfio_cxl_init_device(struct vfio_pci_core_device *vdev)
 {
+	struct pci_dev *pdev = vdev->pdev;
+	struct vfio_cxl_state *cxl;
+	struct cxl_memdev *cxlmd;
+	u64 hdm_size, serial;
+	u16 dvsec;
+	int ret;
+
+	/* pdev->hdm is populated at PCI enumeration; defer until it is. */
+	if (!pdev->hdm)
+		return -EPROBE_DEFER;
+
+	hdm_size = range_len(&pdev->hdm->settings[0].hpa_range);
+	if (!hdm_size)
+		return -ENXIO;
+
+	dvsec = pci_find_dvsec_capability(pdev, PCI_VENDOR_ID_CXL,
+					  PCI_DVSEC_CXL_DEVICE);
+	serial = pci_get_dsn(pdev);
+
+	cxl = devm_cxl_dev_state_create(&pdev->dev, CXL_DEVTYPE_DEVMEM, serial,
+					dvsec, struct vfio_cxl_state, cxlds,
+					false);
+	if (!cxl)
+		return -ENOMEM;
+
+	ret = cxl_set_capacity(&cxl->cxlds, hdm_size);
+	if (ret)
+		return ret;
+
+	cxlmd = devm_cxl_probe_mem(&cxl->cxlds, &cxl->hpa_range);
+	if (IS_ERR(cxlmd))
+		return PTR_ERR(cxlmd);
+
+	cxl->cxlmd = cxlmd;
+	vdev->cxl = cxl;
+
 	return 0;
 }
 
 static void vfio_cxl_release_device(struct vfio_pci_core_device *vdev)
 {
+	vdev->cxl = NULL;
 }
 
 static const struct vfio_cxl_ops vfio_cxl_ops = {
@@ -39,3 +91,4 @@ module_exit(vfio_cxl_exit);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("VFIO support for CXL Type-2 devices");
 MODULE_ALIAS("vfio-cxl");
+MODULE_IMPORT_NS("CXL");
