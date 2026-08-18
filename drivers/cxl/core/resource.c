@@ -559,6 +559,7 @@ out_free_info:
 	cxl_pci_hdm_info_free(info);
 	return rc;
 }
+EXPORT_SYMBOL_FOR_MODULES(pci_cxl_hdm_init, "cxl_core");
 
 void pci_cxl_hdm_init(struct pci_dev *pdev)
 {
