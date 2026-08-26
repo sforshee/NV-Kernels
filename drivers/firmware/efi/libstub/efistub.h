@@ -1271,8 +1271,13 @@ efi_status_t efi_zboot_decompress(u8 *out, unsigned long outlen);
 bool efi_slaunch_enabled(const char *cmdline);
 void efi_slaunch_set_cmdline(const char *cmdline);
 bool efi_slaunch_requested(void);
+bool efi_slaunch_test_requested(void);
 void efi_slaunch_get_dlme_data_size(void);
 void efi_slaunch_scrub_imagebase(unsigned long kernel_addr);
+void efi_slaunch_test_prepare(unsigned long kernel_addr);
+void efi_slaunch_test_cancel(void);
+int efi_slaunch_test_add_fdt_record(void *fdt, int chosen);
+void efi_slaunch_test_run(unsigned long kernel_addr, unsigned long fdt_addr);
 extern unsigned long sl_dlme_data_reserve;
 /* Page gap below the DLME data region so the Preamble->DLME DTB-PA
  * handoff slot (SL_DLME_DTB_SLOT_OFFSET) is dedicated scratch, not the

@@ -7,6 +7,7 @@
 #define _ASM_ARM64_DRTM_H
 
 #ifndef __ASSEMBLY__
+#include <linux/bits.h>
 #include <linux/types.h>
 #endif
 
@@ -29,6 +30,7 @@
 #define DRTM_INVALID_PARAMETERS		(-2)
 #define DRTM_DENIED			(-3)
 #define DRTM_INTERNAL_ERROR		(-5)
+#define DRTM_SECONDARY_PE_NOT_OFF	(-10)
 
 /* DEN0113 v1.2 Table 9: DRTM_PARAMETERS revision is 2 */
 #define DRTM_PARAMS_REVISION		2
@@ -46,6 +48,41 @@
  * Private contract (not DEN0113); DTB PA validated before FDT is parsed.
  */
 #define SL_DLME_DTB_SLOT_OFFSET		(-8)
+
+/*
+ * Test-only secondary-PE injection handoff. The AP control block lives at
+ * the start of the page between the DLME image and DLME data. The FDT record
+ * is a fixed-size, big-endian /chosen property updated after ExitBootServices.
+ */
+#define SL_TEST_FDT_PROP		"linux,slaunch-test-result"
+#define SL_TEST_RECORD_VERSION		1
+
+#define SL_TEST_CTRL_READY_OFFSET	0
+#define SL_TEST_CTRL_RELEASE_OFFSET	8
+#define SL_TEST_CTRL_CPU_OFF_RC_OFFSET	16
+
+#ifndef __ASSEMBLY__
+#define SL_TEST_FLAG_AP_READY		BIT(0)
+#define SL_TEST_FLAG_AP_OFF		BIT(1)
+#define SL_TEST_FLAG_QUARANTINED		BIT(2)
+#define SL_TEST_FLAG_AP_STARTED		BIT(3)
+
+enum sl_test_state {
+	SL_TEST_STATE_NONE,
+	SL_TEST_STATE_ARMED,
+	SL_TEST_STATE_PASS,
+	SL_TEST_STATE_FAIL,
+};
+
+enum sl_test_reason {
+	SL_TEST_REASON_NONE,
+	SL_TEST_REASON_SETUP,
+	SL_TEST_REASON_POST_EBS,
+	SL_TEST_REASON_LAUNCH_RETURN,
+	SL_TEST_REASON_LAUNCH_ACCEPTED,
+	SL_TEST_REASON_CLEANUP,
+};
+#endif
 
 /*
  * Full-range DMA protection sentinel (DEN0113 v1.2 §3.14 Table 11 +
@@ -105,6 +142,23 @@ struct dlme_data_header {
 	__le64	impl_defined_region_size;
 };
 
+struct sl_test_ap_control {
+	u64	ready;
+	u64	release;
+	s64	cpu_off_rc;
+};
+
+struct sl_test_fdt_record {
+	__be32	version;
+	__be32	state;
+	__be32	reason;
+	__be32	flags;
+	__be64	target_mpidr;
+	__be64	scratch_pa;
+	__be64	drtm_rc;
+	__be64	detail_rc;
+} __packed;
+
 #ifdef CONFIG_ARM64_SECURE_LAUNCH
 extern unsigned long sl_dlme_region_pa;
 extern unsigned long sl_dlme_data_offset;
@@ -114,6 +168,8 @@ void slaunch_setup(void);
 void slaunch_validate_initrd(void);
 void slaunch_reserve_dlme_data(void);
 void slaunch_measure_post_efi(void);
+void slaunch_test_init(void);
+bool slaunch_test_quarantine_mpidr(u64 mpidr);
 bool slaunch_phys_is_protected_ram(phys_addr_t pa);
 bool slaunch_phys_range_overlaps_protected_ram(phys_addr_t pa, size_t size);
 
@@ -125,6 +181,8 @@ static inline void slaunch_setup(void) { }
 static inline void slaunch_validate_initrd(void) { }
 static inline void slaunch_reserve_dlme_data(void) { }
 static inline void slaunch_measure_post_efi(void) { }
+static inline void slaunch_test_init(void) { }
+static inline bool slaunch_test_quarantine_mpidr(u64 mpidr) { return false; }
 static inline bool slaunch_phys_is_protected_ram(phys_addr_t pa) { return false; }
 static inline bool slaunch_phys_range_overlaps_protected_ram(phys_addr_t pa, size_t size) { return false; }
 static inline bool slaunch_active(void) { return false; }

@@ -7,9 +7,14 @@
  */
 
 #include <linux/efi.h>
+#include <linux/libfdt.h>
+#include <linux/psci.h>
+#include <uapi/linux/psci.h>
 #include <asm/drtm.h>
+#include <asm/cputype.h>
 #include <asm/efi.h>
 #include <asm/sections.h>
+#include <asm/sysreg.h>
 
 #include "efistub.h"
 
@@ -28,6 +33,9 @@
 
 /* From sl_stub.S — accessible via __efistub_ alias in image-vars.h */
 extern char sl_entry[];
+#ifdef CONFIG_ARM64_SECURE_LAUNCH_FAULT_INJECT
+extern char sl_test_ap_entry[];
+#endif
 
 /*
  * DRTM Parameters (DEN0113 v1.2 §3.13 / Table 9)
@@ -49,12 +57,72 @@ struct sl_drtm_params {
 	__le64	mem_prot_table_size;
 } __packed;
 
-static u64 sl_smc_ret(u64 fn, u64 arg1)
+#ifdef CONFIG_ARM64_SECURE_LAUNCH_FAULT_INJECT
+#define SL_EFI_PROCESSOR_AS_BSP	BIT(0)
+#define SL_EFI_PROCESSOR_ENABLED	BIT(1)
+#define SL_TEST_TIMEOUT_US	1000000
+
+struct sl_efi_cpu_location {
+	u32 package;
+	u32 core;
+	u32 thread;
+};
+
+struct sl_efi_cpu_location2 {
+	u32 package;
+	u32 module;
+	u32 tile;
+	u32 die;
+	u32 core;
+	u32 thread;
+};
+
+struct sl_efi_processor_info {
+	u64 processor_id;
+	u32 status_flag;
+	struct sl_efi_cpu_location location;
+	struct sl_efi_cpu_location2 extended_information;
+};
+
+struct sl_efi_mp_services;
+
+struct sl_efi_mp_services {
+	efi_status_t (__efiapi *get_number_of_processors)(
+		struct sl_efi_mp_services *this, unsigned long *total,
+		unsigned long *enabled);
+	efi_status_t (__efiapi *get_processor_info)(
+		struct sl_efi_mp_services *this, unsigned long processor,
+		struct sl_efi_processor_info *info);
+	void *startup_all_aps;
+	void *startup_this_ap;
+	void *switch_bsp;
+	void *enable_disable_ap;
+	void *who_am_i;
+};
+
+static efi_guid_t sl_efi_mp_services_guid =
+	EFI_GUID(0x3fdda605, 0xa76e, 0x4f46, 0xad, 0x29, 0x12, 0xf4,
+		 0x53, 0x1b, 0x3d, 0x08);
+
+struct sl_test_status {
+	u32 state;
+	u32 reason;
+	u32 flags;
+	u64 target_mpidr;
+	u64 scratch_pa;
+	s64 drtm_rc;
+	s64 detail_rc;
+};
+
+static struct sl_test_status sl_test;
+#endif
+
+static u64 sl_smc_ret4(u64 fn, u64 arg1, u64 arg2, u64 arg3)
 {
 	register u64 x0 __asm__("x0") = fn;
 	register u64 x1 __asm__("x1") = arg1;
-	register u64 x2 __asm__("x2") = 0;
-	register u64 x3 __asm__("x3") = 0;
+	register u64 x2 __asm__("x2") = arg2;
+	register u64 x3 __asm__("x3") = arg3;
 
 	asm volatile("smc #0"
 		: "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
@@ -63,6 +131,11 @@ static u64 sl_smc_ret(u64 fn, u64 arg1)
 		  "x11", "x12", "x13", "x14", "x15", "x16", "x17",
 		  "memory");
 	return x0;
+}
+
+static u64 sl_smc_ret(u64 fn, u64 arg1)
+{
+	return sl_smc_ret4(fn, arg1, 0, 0);
 }
 
 static void sl_smc(u64 fn, u64 arg1)
@@ -246,14 +319,294 @@ bool efi_slaunch_requested(void)
 	return efi_slaunch_enabled(sl_cmdline);
 }
 
+#ifdef CONFIG_ARM64_SECURE_LAUNCH_FAULT_INJECT
+static const char *sl_cmdline_value(const char *key)
+{
+	size_t keylen = strlen(key);
+	const char *p = sl_cmdline;
+
+	if (!p)
+		return NULL;
+
+	while ((p = strstr(p, key)) != NULL) {
+		if ((p == sl_cmdline || p[-1] == ' ' || p[-1] == '\t') &&
+		    p[keylen] != '\0' && p[keylen] != ' ' && p[keylen] != '\t')
+			return p + keylen;
+		p += keylen;
+	}
+	return NULL;
+}
+
+bool efi_slaunch_test_requested(void)
+{
+	return sl_cmdline &&
+		sl_cmdline_token(sl_cmdline, "slaunch_inject=secondary_pe_on");
+}
+
+static s64 sl_psci_affinity_info(u64 mpidr)
+{
+	return (s64)sl_smc_ret4(PSCI_0_2_FN64_AFFINITY_INFO, mpidr, 0, 0);
+}
+
+static void sl_test_set_failure(u32 reason, s64 detail)
+{
+	sl_test.state = SL_TEST_STATE_FAIL;
+	sl_test.reason = reason;
+	sl_test.detail_rc = detail;
+}
+
+static void sl_test_record_to_fdt(struct sl_test_fdt_record *record)
+{
+	record->version = cpu_to_fdt32(SL_TEST_RECORD_VERSION);
+	record->state = cpu_to_fdt32(sl_test.state);
+	record->reason = cpu_to_fdt32(sl_test.reason);
+	record->flags = cpu_to_fdt32(sl_test.flags);
+	record->target_mpidr = cpu_to_fdt64(sl_test.target_mpidr);
+	record->scratch_pa = cpu_to_fdt64(sl_test.scratch_pa);
+	record->drtm_rc = cpu_to_fdt64((u64)sl_test.drtm_rc);
+	record->detail_rc = cpu_to_fdt64((u64)sl_test.detail_rc);
+}
+
+int efi_slaunch_test_add_fdt_record(void *fdt, int chosen)
+{
+	struct sl_test_fdt_record record;
+
+	if (!efi_slaunch_test_requested())
+		return 0;
+
+	sl_test_record_to_fdt(&record);
+	return fdt_setprop(fdt, chosen, SL_TEST_FDT_PROP, &record,
+			   sizeof(record));
+}
+
+static void sl_test_update_fdt_record(void *fdt)
+{
+	struct sl_test_fdt_record record;
+	int chosen;
+
+	chosen = fdt_path_offset(fdt, "/chosen");
+	if (chosen < 0)
+		return;
+
+	sl_test_record_to_fdt(&record);
+	if (fdt_setprop_inplace(fdt, chosen, SL_TEST_FDT_PROP, &record,
+				sizeof(record)))
+		return;
+
+	sl_dc_cvac_range((unsigned long)fdt, fdt_totalsize(fdt));
+	asm volatile("dsb sy" : : : "memory");
+}
+
+static bool sl_test_parse_target(u64 *target)
+{
+	const char *value = sl_cmdline_value("slaunch_inject_mpidr=");
+	char *end;
+	u64 mpidr;
+
+	if (!value)
+		return false;
+
+	mpidr = simple_strtoull(value, &end, 0);
+	if (end == value || (*end && *end != ' ' && *end != '\t') ||
+	    (mpidr & ~MPIDR_HWID_BITMASK)) {
+		sl_test_set_failure(SL_TEST_REASON_SETUP, -EINVAL);
+		return true;
+	}
+
+	*target = mpidr;
+	return true;
+}
+
+static bool sl_test_wait_ready(struct sl_test_ap_control *ctrl)
+{
+	unsigned int i;
+
+	for (i = 0; i < SL_TEST_TIMEOUT_US / 10; i++) {
+		asm volatile("dc ivac, %0" : : "r"(ctrl) : "memory");
+		asm volatile("dsb sy" : : : "memory");
+		if (READ_ONCE(ctrl->ready))
+			return true;
+		efi_bs_call(stall, 10);
+	}
+	return false;
+}
+
+static bool sl_test_stop_ap(void);
+
+void efi_slaunch_test_prepare(unsigned long kernel_addr)
+{
+	struct sl_efi_mp_services *mp;
+	struct sl_efi_processor_info info;
+	struct sl_test_ap_control *ctrl;
+	efi_status_t status;
+	unsigned long total, enabled, i;
+	unsigned long kernel_memsize, ap_entry;
+	u64 requested_mpidr = 0, current_mpidr;
+	bool explicit_target, found = false;
+	s64 rc;
+
+	if (!efi_slaunch_test_requested())
+		return;
+
+	memset(&sl_test, 0, sizeof(sl_test));
+	sl_test.state = SL_TEST_STATE_FAIL;
+	sl_test.reason = SL_TEST_REASON_SETUP;
+	sl_test.drtm_rc = DRTM_NOT_SUPPORTED;
+
+	if (!efi_slaunch_requested() || !sl_drtm_available) {
+		sl_test.detail_rc = -EOPNOTSUPP;
+		return;
+	}
+
+	explicit_target = sl_test_parse_target(&requested_mpidr);
+	if (sl_test.state == SL_TEST_STATE_FAIL && sl_test.detail_rc)
+		return;
+
+	status = efi_bs_call(locate_protocol, &sl_efi_mp_services_guid,
+			     NULL, (void **)&mp);
+	if (status != EFI_SUCCESS) {
+		sl_test.detail_rc = status;
+		return;
+	}
+
+	status = mp->get_number_of_processors(mp, &total, &enabled);
+	if (status != EFI_SUCCESS || enabled < 2) {
+		sl_test.detail_rc = status != EFI_SUCCESS ? status : -ENODEV;
+		return;
+	}
+
+	asm volatile("mrs %0, mpidr_el1" : "=r"(current_mpidr));
+	current_mpidr &= MPIDR_HWID_BITMASK;
+
+	for (i = 0; i < total; i++) {
+		u64 mpidr;
+
+		status = mp->get_processor_info(mp, i, &info);
+		if (status != EFI_SUCCESS ||
+		    !(info.status_flag & SL_EFI_PROCESSOR_ENABLED) ||
+		    (info.status_flag & SL_EFI_PROCESSOR_AS_BSP))
+			continue;
+
+		mpidr = info.processor_id & MPIDR_HWID_BITMASK;
+		if (mpidr == current_mpidr ||
+		    (explicit_target && mpidr != requested_mpidr))
+			continue;
+
+		sl_test.target_mpidr = mpidr;
+		found = true;
+		break;
+	}
+
+	if (!found) {
+		sl_test.detail_rc = -ENODEV;
+		return;
+	}
+
+	rc = sl_psci_affinity_info(sl_test.target_mpidr);
+	if (rc != PSCI_0_2_AFFINITY_LEVEL_OFF) {
+		sl_test.detail_rc = rc;
+		return;
+	}
+
+	kernel_memsize = (unsigned long)(_end - _text);
+	sl_test.scratch_pa = kernel_addr + SL_ROUND_UP_PAGE(kernel_memsize);
+	ctrl = (struct sl_test_ap_control *)(unsigned long)sl_test.scratch_pa;
+	memset(ctrl, 0, sizeof(*ctrl));
+	sl_dc_cvac_range((unsigned long)ctrl, sizeof(*ctrl));
+	asm volatile("dsb sy" : : : "memory");
+
+	ap_entry = kernel_addr +
+		((unsigned long)sl_test_ap_entry - (unsigned long)_text);
+	rc = (s64)sl_smc_ret4(PSCI_0_2_FN64_CPU_ON, sl_test.target_mpidr,
+			       ap_entry, sl_test.scratch_pa);
+	if (rc != PSCI_RET_SUCCESS) {
+		sl_test.detail_rc = rc;
+		return;
+	}
+	sl_test.flags |= SL_TEST_FLAG_AP_STARTED;
+
+	if (!sl_test_wait_ready(ctrl)) {
+		sl_test.detail_rc = -ETIMEDOUT;
+		if (!sl_test_stop_ap())
+			sl_test.reason = SL_TEST_REASON_CLEANUP;
+		return;
+	}
+
+	sl_test.state = SL_TEST_STATE_ARMED;
+	sl_test.reason = SL_TEST_REASON_NONE;
+	sl_test.flags |= SL_TEST_FLAG_AP_READY;
+	sl_test.detail_rc = 0;
+	efi_err("DRTM test: ARMED secondary PE MPIDR 0x%llx\n",
+		sl_test.target_mpidr);
+}
+
+static bool sl_test_stop_ap(void)
+{
+	struct sl_test_ap_control *ctrl;
+	u64 deadline;
+	s64 rc;
+
+	if (!(sl_test.flags & SL_TEST_FLAG_AP_STARTED))
+		return true;
+
+	ctrl = (struct sl_test_ap_control *)(unsigned long)sl_test.scratch_pa;
+	WRITE_ONCE(ctrl->release, 1);
+	sl_dc_cvac_range((unsigned long)&ctrl->release, sizeof(ctrl->release));
+	asm volatile("dsb sy; sev" : : : "memory");
+
+	deadline = read_sysreg(cntvct_el0) + read_sysreg(cntfrq_el0);
+	do {
+		rc = sl_psci_affinity_info(sl_test.target_mpidr);
+		if (rc == PSCI_0_2_AFFINITY_LEVEL_OFF) {
+			sl_test.flags |= SL_TEST_FLAG_AP_OFF;
+			return true;
+		}
+		asm volatile("yield");
+	} while ((s64)(deadline - read_sysreg(cntvct_el0)) > 0);
+
+	asm volatile("dc ivac, %0" : : "r"(ctrl) : "memory");
+	asm volatile("dsb sy" : : : "memory");
+	sl_test.detail_rc = READ_ONCE(ctrl->cpu_off_rc);
+	if (!sl_test.detail_rc)
+		sl_test.detail_rc = -ETIMEDOUT;
+	sl_test.flags |= SL_TEST_FLAG_QUARANTINED;
+	return false;
+}
+
+void efi_slaunch_test_cancel(void)
+{
+	if (!efi_slaunch_test_requested() ||
+	    !(sl_test.flags & SL_TEST_FLAG_AP_STARTED))
+		return;
+
+	if (!sl_test_stop_ap())
+		efi_err("DRTM test: failed to stop secondary PE 0x%llx\n",
+			sl_test.target_mpidr);
+}
+#else
+bool efi_slaunch_test_requested(void)
+{
+	return false;
+}
+
+void efi_slaunch_test_prepare(unsigned long kernel_addr) { }
+
+void efi_slaunch_test_cancel(void) { }
+
+int efi_slaunch_test_add_fdt_record(void *fdt, int chosen)
+{
+	return 0;
+}
+#endif
+
 /*
  * TF-A requires DRTM_PARAMETERS to be 4KB-aligned; we are past
  * ExitBootServices so cannot allocate — use a static buffer.
  */
 static struct sl_drtm_params sl_params __aligned(SL_DRTM_PAGE_SIZE);
 
-void __noreturn efi_slaunch_drtm(unsigned long kernel_addr,
-				 unsigned long fdt_addr)
+static struct sl_drtm_params *sl_build_drtm_params(unsigned long kernel_addr,
+						    unsigned long fdt_addr)
 {
 	struct sl_drtm_params *params = &sl_params;
 	unsigned long image_size, kernel_memsize;
@@ -318,6 +671,15 @@ void __noreturn efi_slaunch_drtm(unsigned long kernel_addr,
 	 * to unprotect the header page is unreachable after boot services exit.
 	 */
 	asm volatile("dsb sy" : : : "memory");
+	return params;
+}
+
+void __noreturn efi_slaunch_drtm(unsigned long kernel_addr,
+				 unsigned long fdt_addr)
+{
+	struct sl_drtm_params *params;
+
+	params = sl_build_drtm_params(kernel_addr, fdt_addr);
 
 	/*
 	 * DRTM_DYNAMIC_LAUNCH — does not return on success.
@@ -334,3 +696,51 @@ void __noreturn efi_slaunch_drtm(unsigned long kernel_addr,
 	for (;;)
 		asm volatile("wfi");
 }
+
+#ifdef CONFIG_ARM64_SECURE_LAUNCH_FAULT_INJECT
+void efi_slaunch_test_run(unsigned long kernel_addr, unsigned long fdt_addr)
+{
+	struct sl_drtm_params *params;
+	s64 rc;
+
+	if (!efi_slaunch_test_requested())
+		return;
+
+	if (sl_test.state != SL_TEST_STATE_ARMED) {
+		sl_test_update_fdt_record((void *)fdt_addr);
+		return;
+	}
+
+	rc = sl_psci_affinity_info(sl_test.target_mpidr);
+	if (rc != PSCI_0_2_AFFINITY_LEVEL_ON) {
+		sl_test_set_failure(SL_TEST_REASON_POST_EBS, rc);
+		sl_test_stop_ap();
+		sl_test_update_fdt_record((void *)fdt_addr);
+		return;
+	}
+
+	/* Make the ARMED breadcrumb visible if firmware incorrectly launches. */
+	sl_test_update_fdt_record((void *)fdt_addr);
+	params = sl_build_drtm_params(kernel_addr, fdt_addr);
+	sl_test.drtm_rc = (s64)sl_smc_ret(SL_DRTM_SMC_DYNAMIC_LAUNCH,
+					  (u64)params);
+
+	if (sl_test.drtm_rc == DRTM_SECONDARY_PE_NOT_OFF) {
+		sl_test.state = SL_TEST_STATE_PASS;
+		sl_test.reason = SL_TEST_REASON_NONE;
+		sl_test.detail_rc = 0;
+	} else {
+		sl_test_set_failure(SL_TEST_REASON_LAUNCH_RETURN,
+				    sl_test.drtm_rc);
+	}
+
+	if (!sl_test_stop_ap()) {
+		sl_test.state = SL_TEST_STATE_FAIL;
+		sl_test.reason = SL_TEST_REASON_CLEANUP;
+	}
+
+	sl_test_update_fdt_record((void *)fdt_addr);
+}
+#else
+void efi_slaunch_test_run(unsigned long kernel_addr, unsigned long fdt_addr) { }
+#endif

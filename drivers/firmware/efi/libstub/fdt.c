@@ -138,6 +138,12 @@ static efi_status_t update_fdt(void *orig_fdt, unsigned long orig_fdt_size,
 	if (status)
 		goto fdt_set_fail;
 
+#ifdef CONFIG_ARM64_SECURE_LAUNCH
+	status = efi_slaunch_test_add_fdt_record(fdt, node);
+	if (status)
+		goto fdt_set_fail;
+#endif
+
 	/* Shrink the FDT back to its minimum size: */
 	fdt_pack(fdt);
 
@@ -354,13 +360,18 @@ efi_status_t efi_boot_kernel(void *handle, efi_loaded_image_t *image,
 	efi_status_t status;
 
 #ifdef CONFIG_ARM64_SECURE_LAUNCH
+	efi_slaunch_test_prepare(kernel_addr);
+
 	/*
 	 * Announce the DRTM decision while boot services can still print: the
-	 * launch runs after ExitBootServices with no console, so a failed
-	 * launch only halts. The info breadcrumb is suppressed by "quiet" (and
-	 * by the default log level on 7.0); the error survives "quiet".
+	 * launch runs after ExitBootServices with no console. A failed
+	 * production launch halts; the negative test instead records its result
+	 * and continues into the kernel. The info breadcrumb is suppressed by
+	 * "quiet" (and by the default log level on 7.0).
 	 */
-	if (efi_slaunch_enabled(cmdline_ptr) && sl_drtm_available)
+	if (efi_slaunch_test_requested())
+		efi_info("DRTM: secondary-PE negative test requested\n");
+	else if (efi_slaunch_enabled(cmdline_ptr) && sl_drtm_available)
 		efi_info("DRTM: launching; a halt after this means it failed\n");
 	else if (efi_slaunch_enabled(cmdline_ptr))
 		efi_err("DRTM: firmware lacks DRTM support; booting normally\n");
@@ -370,6 +381,9 @@ efi_status_t efi_boot_kernel(void *handle, efi_loaded_image_t *image,
 						cmdline_ptr);
 	if (status != EFI_SUCCESS) {
 		efi_err("Failed to update FDT and exit boot services\n");
+#ifdef CONFIG_ARM64_SECURE_LAUNCH
+		efi_slaunch_test_cancel();
+#endif
 		return status;
 	}
 
@@ -377,8 +391,11 @@ efi_status_t efi_boot_kernel(void *handle, efi_loaded_image_t *image,
 		efi_handle_post_ebs_state();
 
 #ifdef CONFIG_ARM64_SECURE_LAUNCH
-	/* Requested + firmware-advertised launch; announced pre-EBS above. */
-	if (efi_slaunch_enabled(cmdline_ptr) && sl_drtm_available)
+	/* The negative test always returns to the normal kernel on failure. */
+	if (efi_slaunch_test_requested())
+		efi_slaunch_test_run(kernel_addr, fdt_addr);
+	/* Requested + firmware-advertised production launch. */
+	else if (efi_slaunch_enabled(cmdline_ptr) && sl_drtm_available)
 		efi_slaunch_drtm(kernel_addr, fdt_addr);
 #endif
 

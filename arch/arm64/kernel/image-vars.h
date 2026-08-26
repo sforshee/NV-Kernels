@@ -44,6 +44,9 @@ PROVIDE(__efistub__ctype		= _ctype);
 
 #ifdef CONFIG_ARM64_SECURE_LAUNCH
 PROVIDE(__efistub_sl_entry		= sl_entry);
+#ifdef CONFIG_ARM64_SECURE_LAUNCH_FAULT_INJECT
+PROVIDE(__efistub_sl_test_ap_entry	= sl_test_ap_entry);
+#endif
 #endif
 
 /*

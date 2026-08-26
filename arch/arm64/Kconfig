@@ -2463,7 +2463,8 @@ config ARM64_SECURE_LAUNCH_SELFTEST
 
 config ARM64_SECURE_LAUNCH_FAULT_INJECT
 	bool "ARM64 DRTM Secure Launch fault injection"
-	depends on ARM64_SECURE_LAUNCH
+	depends on ARM64_SECURE_LAUNCH && !EFI_ZBOOT
+	select SECURITYFS
 	default n
 	help
 	  Build slaunch_inject_fault() into the kernel. When the kernel
@@ -2473,7 +2474,14 @@ config ARM64_SECURE_LAUNCH_FAULT_INJECT
 	  guard is expected to panic with a specific message; the harness
 	  treats that as a passing negative test.
 
-	  Tokens implemented: mmap_wrap, mmap_pages_overflow,
+	  Most fault-injection tokens deliberately panic when validation
+	  rejects their malformed input. The secondary_pe_on token instead
+	  starts a secondary PE before DRTM_DYNAMIC_LAUNCH and always proceeds
+	  into the kernel; its result is reported in
+	  securityfs/slaunch/negative_test_result. An optional
+	  slaunch_inject_mpidr=<MPIDR> selects the target PE.
+
+	  Tokens implemented: secondary_pe_on, mmap_wrap, mmap_pages_overflow,
 	  mmap_size_huge, systab_nr_tables_huge, sha384_force,
 	  sha_algo_bad.
 

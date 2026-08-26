@@ -43,6 +43,7 @@
 #include <asm/cputype.h>
 #include <asm/cpu_ops.h>
 #include <asm/daifflags.h>
+#include <asm/drtm.h>
 #include <asm/kvm_mmu.h>
 #include <asm/mmu_context.h>
 #include <asm/numa.h>
@@ -605,6 +606,11 @@ acpi_map_gic_cpu_interface(struct acpi_madt_generic_interrupt *processor)
 		return;
 	}
 
+	if (slaunch_test_quarantine_mpidr(hwid)) {
+		pr_warn("slaunch-test: quarantining CPU MPIDR 0x%llx\n", hwid);
+		return;
+	}
+
 	if (cpu_count >= NR_CPUS)
 		return;
 
@@ -717,6 +723,12 @@ static void __init of_parse_and_init_cpus(void)
 			 * incrementing cpu.
 			 */
 			continue;
+		}
+
+		if (slaunch_test_quarantine_mpidr(hwid)) {
+			pr_warn("slaunch-test: quarantining CPU MPIDR 0x%llx\n",
+				hwid);
+			goto next;
 		}
 
 		if (cpu_count >= NR_CPUS)

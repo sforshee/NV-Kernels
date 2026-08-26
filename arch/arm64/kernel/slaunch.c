@@ -13,14 +13,19 @@
 #include <linux/of_fdt.h>
 #include <linux/libfdt.h>
 #include <linux/arm-smccc.h>
+#include <linux/psci.h>
+#include <uapi/linux/psci.h>
 #include <linux/overflow.h>
 #include <linux/initrd.h>
 #include <linux/security.h>
 #include <crypto/sha2.h>
 
 #include <asm/drtm.h>
+#include <asm/cacheflush.h>
+#include <asm/cputype.h>
 #include <asm/memory.h>
 #include <asm/setup.h>
+#include <asm/sysreg.h>
 
 /*
  * Hash algorithm dispatch. The DLME must match the D-CRTM firmware hash
@@ -140,6 +145,20 @@ static unsigned long sl_efi_nr_tables;
 static u8 *sl_kernel_evlog;
 static size_t sl_kernel_evlog_size;
 static size_t sl_kernel_evlog_capacity;
+
+#ifdef CONFIG_ARM64_SECURE_LAUNCH_FAULT_INJECT
+static bool sl_test_present;
+static bool sl_test_quarantine;
+static u64 sl_test_target_mpidr;
+static u64 sl_test_scratch_pa;
+static u32 sl_test_state;
+static u32 sl_test_reason;
+static u32 sl_test_flags;
+static s64 sl_test_drtm_rc;
+static s64 sl_test_detail_rc;
+static char sl_test_result[384];
+static size_t sl_test_result_size;
+#endif
 
 /*
  * Close TPM locality 2 — the DLME's locality, per DEN0113 v1.2 §4.6.1.
@@ -554,6 +573,157 @@ void __init slaunch_early_init(void)
 	pr_info("slaunch: DTB validated: magic=0x%08x, size=%u bytes, in NORMAL region\n",
 		fdt_magic, fdt_size);
 }
+
+#ifdef CONFIG_ARM64_SECURE_LAUNCH_FAULT_INJECT
+static const char * __init sl_test_reason_name(u32 reason)
+{
+	switch (reason) {
+	case SL_TEST_REASON_NONE:
+		return "none";
+	case SL_TEST_REASON_SETUP:
+		return "setup";
+	case SL_TEST_REASON_POST_EBS:
+		return "post_ebs";
+	case SL_TEST_REASON_LAUNCH_RETURN:
+		return "launch_return";
+	case SL_TEST_REASON_LAUNCH_ACCEPTED:
+		return "launch_accepted";
+	case SL_TEST_REASON_CLEANUP:
+		return "cleanup";
+	default:
+		return "unknown";
+	}
+}
+
+static s64 __init sl_test_psci_affinity_info(u64 mpidr)
+{
+	struct arm_smccc_res res;
+
+	arm_smccc_smc(PSCI_0_2_FN64_AFFINITY_INFO, mpidr, 0, 0,
+		      0, 0, 0, 0, &res);
+	return (s64)res.a0;
+}
+
+static bool __init sl_test_release_accepted_ap(void)
+{
+	struct sl_test_ap_control *ctrl;
+	u64 expected_scratch, deadline;
+	s64 rc;
+
+	/* The scratch page is the final page immediately below DLME data. */
+	expected_scratch = sl_dlme_region_pa + sl_dlme_data_offset - PAGE_SIZE;
+	if (sl_test_scratch_pa != expected_scratch) {
+		sl_test_detail_rc = -EINVAL;
+		return false;
+	}
+
+	ctrl = early_memremap(sl_test_scratch_pa, sizeof(*ctrl));
+	if (!ctrl) {
+		sl_test_detail_rc = -ENOMEM;
+		return false;
+	}
+
+	WRITE_ONCE(ctrl->release, 1);
+	dcache_clean_poc((unsigned long)&ctrl->release,
+			 (unsigned long)&ctrl->release + sizeof(ctrl->release));
+	dsb(sy);
+	asm volatile("sev" : : : "memory");
+
+	deadline = read_sysreg(cntvct_el0) + read_sysreg(cntfrq_el0);
+	do {
+		rc = sl_test_psci_affinity_info(sl_test_target_mpidr);
+		if (rc == PSCI_0_2_AFFINITY_LEVEL_OFF) {
+			sl_test_flags |= SL_TEST_FLAG_AP_OFF;
+			early_memunmap(ctrl, sizeof(*ctrl));
+			return true;
+		}
+		cpu_relax();
+	} while ((s64)(deadline - read_sysreg(cntvct_el0)) > 0);
+
+	dcache_inval_poc((unsigned long)ctrl,
+			 (unsigned long)ctrl + sizeof(*ctrl));
+	sl_test_detail_rc = READ_ONCE(ctrl->cpu_off_rc);
+	if (!sl_test_detail_rc)
+		sl_test_detail_rc = -ETIMEDOUT;
+	early_memunmap(ctrl, sizeof(*ctrl));
+	return false;
+}
+
+void __init slaunch_test_init(void)
+{
+	const struct sl_test_fdt_record *record;
+	const void *fdt = initial_boot_params;
+	const char *reason;
+	int chosen, len;
+
+	chosen = fdt_path_offset(fdt, "/chosen");
+	if (chosen < 0)
+		return;
+
+	record = fdt_getprop(fdt, chosen, SL_TEST_FDT_PROP, &len);
+	if (!record || len != sizeof(*record) ||
+	    fdt32_to_cpu(record->version) != SL_TEST_RECORD_VERSION)
+		return;
+
+	sl_test_present = true;
+	sl_test_state = fdt32_to_cpu(record->state);
+	sl_test_reason = fdt32_to_cpu(record->reason);
+	sl_test_flags = fdt32_to_cpu(record->flags);
+	sl_test_target_mpidr = fdt64_to_cpu(record->target_mpidr);
+	sl_test_scratch_pa = fdt64_to_cpu(record->scratch_pa);
+	sl_test_drtm_rc = (s64)fdt64_to_cpu(record->drtm_rc);
+	sl_test_detail_rc = (s64)fdt64_to_cpu(record->detail_rc);
+
+	if (sl_test_state == SL_TEST_STATE_ARMED) {
+		sl_test_state = SL_TEST_STATE_FAIL;
+		sl_test_reason = SL_TEST_REASON_LAUNCH_ACCEPTED;
+		if (!sl_test_release_accepted_ap())
+			sl_test_flags |= SL_TEST_FLAG_QUARANTINED;
+	}
+
+	if (sl_test_flags & SL_TEST_FLAG_QUARANTINED) {
+		sl_test_quarantine = true;
+		if (sl_test_scratch_pa)
+			memblock_reserve(ALIGN_DOWN(sl_test_scratch_pa, PAGE_SIZE),
+					 PAGE_SIZE);
+	}
+
+	reason = sl_test_reason_name(sl_test_reason);
+	sl_test_result_size = scnprintf(sl_test_result, sizeof(sl_test_result),
+		"state=%s\nreason=%s\ntarget_mpidr=0x%llx\ndrtm_rc=%lld\n"
+		"detail_rc=%lld\nap_ready=%s\nap_cleanup=%s\n"
+		"target_quarantined=%s\n",
+		sl_test_state == SL_TEST_STATE_PASS ? "pass" : "fail",
+		reason, sl_test_target_mpidr, sl_test_drtm_rc,
+		sl_test_detail_rc,
+		(sl_test_flags & SL_TEST_FLAG_AP_READY) ? "yes" : "no",
+		(sl_test_flags & SL_TEST_FLAG_AP_OFF) ? "off" :
+		(sl_test_flags & SL_TEST_FLAG_QUARANTINED) ? "quarantined" :
+		"not_confirmed",
+		sl_test_quarantine ? "yes" : "no");
+
+	if (sl_test_state == SL_TEST_STATE_PASS)
+		pr_notice("slaunch-test: PASS target=0x%llx drtm_rc=%lld cleanup=off\n",
+			  sl_test_target_mpidr, sl_test_drtm_rc);
+	else
+		pr_err("slaunch-test: FAIL reason=%s target=0x%llx drtm_rc=%lld detail_rc=%lld quarantine=%s\n",
+		       reason, sl_test_target_mpidr, sl_test_drtm_rc,
+		       sl_test_detail_rc, sl_test_quarantine ? "yes" : "no");
+}
+
+bool __init slaunch_test_quarantine_mpidr(u64 mpidr)
+{
+	return sl_test_quarantine &&
+		((mpidr & MPIDR_HWID_BITMASK) == sl_test_target_mpidr);
+}
+#else
+void __init slaunch_test_init(void) { }
+
+bool __init slaunch_test_quarantine_mpidr(u64 mpidr)
+{
+	return false;
+}
+#endif
 
 /*
  * Validate all untrusted EFI inputs BEFORE efi_init() consumes them
@@ -2280,12 +2450,37 @@ static const struct file_operations slaunch_evlog_fops = {
 	.llseek	= default_llseek,
 };
 
+#ifdef CONFIG_ARM64_SECURE_LAUNCH_FAULT_INJECT
+static ssize_t slaunch_test_result_read(struct file *file, char __user *buf,
+					size_t count, loff_t *ppos)
+{
+	return simple_read_from_buffer(buf, count, ppos, sl_test_result,
+				       sl_test_result_size);
+}
+
+static const struct file_operations slaunch_test_result_fops = {
+	.owner	= THIS_MODULE,
+	.read	= slaunch_test_result_read,
+	.llseek	= default_llseek,
+};
+#endif
+
 static struct dentry *sl_securityfs_dir;
 static struct dentry *sl_securityfs_evlog;
+#ifdef CONFIG_ARM64_SECURE_LAUNCH_FAULT_INJECT
+static struct dentry *sl_securityfs_test_result;
+#endif
 
 static int __init slaunch_securityfs_init(void)
 {
-	if (!sl_kernel_evlog || !sl_kernel_evlog_size)
+	bool have_evlog = sl_kernel_evlog && sl_kernel_evlog_size;
+#ifdef CONFIG_ARM64_SECURE_LAUNCH_FAULT_INJECT
+	bool have_test_result = sl_test_present && sl_test_result_size;
+#else
+	bool have_test_result = false;
+#endif
+
+	if (!have_evlog && !have_test_result)
 		return 0;
 
 	sl_securityfs_dir = securityfs_create_dir("slaunch", NULL);
@@ -2296,22 +2491,37 @@ static int __init slaunch_securityfs_init(void)
 		return 0;
 	}
 
-	sl_securityfs_evlog = securityfs_create_file("drtm_event_log",
-						     0440,
-						     sl_securityfs_dir,
-						     NULL,
-						     &slaunch_evlog_fops);
-	if (IS_ERR(sl_securityfs_evlog)) {
-		pr_warn("slaunch: securityfs_create_file failed: %ld\n",
-			PTR_ERR(sl_securityfs_evlog));
-		securityfs_remove(sl_securityfs_dir);
-		sl_securityfs_dir = NULL;
-		sl_securityfs_evlog = NULL;
-		return 0;
+	if (have_evlog) {
+		sl_securityfs_evlog = securityfs_create_file("drtm_event_log",
+							     0440,
+							     sl_securityfs_dir,
+							     NULL,
+							     &slaunch_evlog_fops);
+		if (IS_ERR(sl_securityfs_evlog)) {
+			pr_warn("slaunch: drtm_event_log creation failed: %ld\n",
+				PTR_ERR(sl_securityfs_evlog));
+			sl_securityfs_evlog = NULL;
+		} else {
+			pr_info("slaunch: securityfs/slaunch/drtm_event_log exposed (%zu B)\n",
+				sl_kernel_evlog_size);
+		}
 	}
 
-	pr_info("slaunch: securityfs/slaunch/drtm_event_log exposed (%zu B)\n",
-		sl_kernel_evlog_size);
+#ifdef CONFIG_ARM64_SECURE_LAUNCH_FAULT_INJECT
+	if (have_test_result) {
+		sl_securityfs_test_result =
+			securityfs_create_file("negative_test_result", 0440,
+					       sl_securityfs_dir, NULL,
+					       &slaunch_test_result_fops);
+		if (IS_ERR(sl_securityfs_test_result)) {
+			pr_warn("slaunch: negative_test_result creation failed: %ld\n",
+				PTR_ERR(sl_securityfs_test_result));
+			sl_securityfs_test_result = NULL;
+		} else {
+			pr_info("slaunch: securityfs/slaunch/negative_test_result exposed\n");
+		}
+	}
+#endif
 	return 0;
 }
 late_initcall(slaunch_securityfs_init);

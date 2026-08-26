@@ -300,6 +300,7 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	 */
 	jump_label_init();
 	parse_early_param();
+	slaunch_test_init();
 
 	dynamic_scs_init();
 
