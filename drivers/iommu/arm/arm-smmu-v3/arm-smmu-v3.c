@@ -3829,11 +3829,13 @@ static int arm_smmu_def_domain_type(struct device *dev)
 		     PCI_DEV_FLAGS_PCI_BRIDGE_NO_ALIAS) &&
 		    pdev->bus->self->vendor == PCI_VENDOR_ID_ASPEED &&
 		    pdev->bus->self->device == 0x1150)
-			return IOMMU_DOMAIN_IDENTITY;
+			return iommu_dma_isolation_enabled() ?
+				IOMMU_DOMAIN_DMA : IOMMU_DOMAIN_IDENTITY;
 
 		if (pdev->vendor == PCI_VENDOR_ID_NVIDIA &&
 		    pdev->device >= 0x2E00 && pdev->device <= 0x2E3F)
-			return IOMMU_DOMAIN_DMA;
+			return iommu_dma_isolation_enabled() ?
+				IOMMU_DOMAIN_DMA : IOMMU_DOMAIN_IDENTITY;
 	}
 
 	return 0;
